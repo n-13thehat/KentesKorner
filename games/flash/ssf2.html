@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Super Smash Flash 2 — Kente's Korner</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;background:#070810;overflow:hidden;
+  font-family:'Courier New',monospace;color:#ccc;font-size:11px}
+
+/* ── Status bar ─────────────────────────────────────────────────── */
+#sb{position:fixed;top:0;left:0;right:0;height:24px;z-index:80;
+  background:rgba(5,5,14,.95);border-bottom:1px solid #111122;
+  display:flex;align-items:center;padding:0 10px;gap:8px;letter-spacing:.1em}
+#sb-dot{width:7px;height:7px;border-radius:50%;background:#333;flex-shrink:0;
+  transition:background .4s}
+#sb-dot.loading{background:#e8a000;animation:pulse 1s infinite}
+#sb-dot.ok{background:#2ecc71}
+#sb-dot.err{background:#c0392b}
+#sb-text{flex:1}
+#sb-count{color:#444;font-size:9px}
+#sb-right{color:#252540;font-size:9px;letter-spacing:.08em}
+
+/* ── Stage ──────────────────────────────────────────────────────── */
+#stage{position:absolute;top:24px;left:0;right:0;bottom:0;
+  display:flex;align-items:center;justify-content:center;background:#070810}
+#stage ruffle-player,#stage>*{width:100%;height:100%}
+
+/* ── Debug panel ────────────────────────────────────────────────── */
+#dbg{position:fixed;bottom:0;left:0;right:0;background:rgba(4,4,12,.97);
+  border-top:1px solid #1a1a3a;padding:9px 12px;z-index:90;display:none}
+#dbg.open{display:block}
+#dbg-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px}
+#dbg-log{height:72px;overflow-y:auto;background:#05050e;border:1px solid #111128;
+  padding:5px;font-size:9px;color:#555;white-space:pre-wrap;word-break:break-all}
+.dl{color:#e8a000;font-size:9px;letter-spacing:.14em;margin-right:2px}
+.db{background:#0b0b1c;border:1px solid #222240;color:#999;
+  padding:3px 9px;cursor:pointer;font:inherit;font-size:10px;
+  letter-spacing:.1em;transition:all .15s}
+.db:hover{background:#181830;color:#e8a000;border-color:#e8a000}
+.db.on{background:#e8a000;color:#000;border-color:#e8a000}
+.db.warn{border-color:#c0392b;color:#c0392b}
+#dbg-hint{position:fixed;top:30px;right:8px;font-size:9px;
+  color:#1a1a30;letter-spacing:.1em;pointer-events:none}
+
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+@keyframes spin{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+
+<div id="sb">
+  <div id="sb-dot" class="loading"></div>
+  <span id="sb-text">INITIALIZING RUFFLE...</span>
+  <span id="sb-count"></span>
+  <span style="flex:1"></span>
+  <span id="sb-right">SSF2 · KENTE'S KORNER · LOCAL</span>
+</div>
+
+<div id="stage"></div>
+<div id="dbg-hint">` = DEBUG PANEL</div>
+
+<div id="dbg">
+  <div id="dbg-row">
+    <span class="dl">SCALE</span>
+    <button class="db on" data-scale="showAll">SHOW ALL</button>
+    <button class="db" data-scale="noBorder">NO BORDER</button>
+    <button class="db" data-scale="exactFit">EXACT FIT</button>
+    <button class="db" data-scale="noScale">NO SCALE</button>
+    &nbsp;
+    <span class="dl">QUALITY</span>
+    <button class="db" data-q="low">LOW</button>
+    <button class="db" data-q="medium">MED</button>
+    <button class="db on" data-q="high">HIGH</button>
+    &nbsp;
+    <button class="db" id="db-fs">⛶ FULLSCREEN</button>
+    <button class="db" id="db-reload">↺ RELOAD</button>
+    <button class="db warn" id="db-wipe">✕ WIPE CACHE</button>
+    <button class="db" id="db-clr">CLR LOG</button>
+    <span style="margin-left:auto;color:#333;font-size:9px" id="db-cacheinfo">—</span>
+  </div>
+  <div id="dbg-log">[KENTE] SSF2 local wrapper — Ruffle + SW asset cache
+[KENTE] First play: assets download and persist to disk via kente-server.
+[KENTE] Subsequent plays: fully offline from L1 (SW Cache) + L2 (disk).
+</div>
+</div>
+
+<script src="./ruffle/ruffle.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  // ── Ruffle config ─────────────────────────────────────────────────────────
+  window.RufflePlayer = window.RufflePlayer || {};
+  window.RufflePlayer.config = {
+    publicPath:       './ruffle/',
+    logLevel:         'warn',
+    backgroundColor:  '#070810',
+  };
+
+  var fetched = 0, hits = 0, errs = 0;
+  var player  = null;
+
+  // ── DOM helpers ───────────────────────────────────────────────────────────
+  var dot   = document.getElementById('sb-dot');
+  var sbTxt = document.getElementById('sb-text');
+  var sbCnt = document.getElementById('sb-count');
+  var dbLog = document.getElementById('dbg-log');
+  var cInfo = document.getElementById('db-cacheinfo');
+
+  function setStatus(state, text) {
+    dot.className = state;   // 'loading' | 'ok' | 'err' | ''
+    sbTxt.textContent = text;
+  }
+  function updateCount() {
+    var total = fetched + hits;
+    sbCnt.textContent = total ? (hits + '↯  ' + fetched + '↓') : '';
+    if (total > 0 && fetched === 0) {
+      setStatus('ok', '⚡ OFFLINE READY — ' + total + ' ASSETS CACHED');
+    } else if (fetched > 0) {
+      setStatus('loading', 'CACHING — ' + fetched + ' NEW  ' + hits + ' CACHED');
+    }
+  }
+  function log(msg) {
+    dbLog.textContent += '[' + new Date().toLocaleTimeString() + '] ' + msg + '\n';
+    dbLog.scrollTop = 99999;
+  }
+
+  // ── Service Worker ────────────────────────────────────────────────────────
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('./sw-ssf2.js', { scope: './' })
+      .then(function (reg) {
+        log('SW registered (scope: ' + reg.scope + ')');
+        // Ask SW how many assets are already cached
+        if (reg.active) reg.active.postMessage({ type: 'get-stats' });
+      })
+      .catch(function (err) { log('SW error: ' + err); });
+
+    navigator.serviceWorker.addEventListener('message', function (evt) {
+      var d = evt.data;
+      if (!d) return;
+      if (d.type === 'hit')           { hits++;   updateCount(); }
+      if (d.type === 'fetched' || d.type === 'fetched-direct') { fetched++; updateCount(); log('↓ ' + d.url); }
+      if (d.type === 'error')         { errs++;   log('ERR ' + d.url + ' — ' + d.msg); dot.className='err'; }
+      if (d.type === 'stats')         { hits = d.count; updateCount(); }
+      if (d.type === 'cache-cleared') { hits=0; fetched=0; updateCount(); log('SW cache cleared.'); }
+    });
+  } else {
+    log('Service Worker not supported — assets will stream from McLeod each time.');
+  }
+
+  // ── Ruffle player ─────────────────────────────────────────────────────────
+  window.addEventListener('load', function () {
+    var ruffle = window.RufflePlayer.newest();
+    player = ruffle.createPlayer();
+    player.style.width  = '100%';
+    player.style.height = '100%';
+    document.getElementById('stage').appendChild(player);
+
+    function loadGame() {
+      player.load({
+        url:               './ssf2.swf',
+        scale:             currentScale(),
+        quality:           currentQuality(),
+        backgroundColor:   '#070810',
+        allowScriptAccess: 'always',
+        allowNetworking:   'all',
+      });
+    }
+    loadGame();
+    setStatus('loading', 'LOADING SSF2...');
+
+    player.addEventListener('loadeddata', function () {
+      log('Core SWF loaded. Assets streaming/cached via Service Worker.');
+      if (!hits && !fetched) setStatus('', 'SSF2 RUNNING');
+
+      // ── Click-to-activate overlay ──────────────────────────────────────────
+      // The Gamepad API requires the iframe to have document focus before
+      // navigator.getGamepads() returns results. This overlay forces a user
+      // click so the browser registers the iframe as the active document.
+      var stage = document.getElementById('stage');
+      var ov = document.createElement('div');
+      ov.id = 'gp-activate';
+      ov.style.cssText = [
+        'position:absolute;inset:0;z-index:50',
+        'display:flex;flex-direction:column;align-items:center;justify-content:center',
+        'background:rgba(4,4,14,0.78);cursor:pointer;gap:10px',
+        "font-family:'Courier New',monospace;color:#888",
+        'letter-spacing:.18em;font-size:11px;transition:opacity .3s',
+      ].join(';');
+      ov.innerHTML = [
+        '<div style="font-size:28px;filter:drop-shadow(0 0 8px #e8a000)">🎮</div>',
+        '<div style="color:#ccc;font-size:13px">CLICK TO ACTIVATE</div>',
+        '<div style="font-size:9px;color:#444;letter-spacing:.1em">ENABLES CONTROLLER + KEYBOARD INPUT</div>',
+        '<div style="font-size:8px;color:#2a2a50;margin-top:4px">THEN PRESS ANY BUTTON ON YOUR CONTROLLER</div>',
+      ].join('');
+
+      ov.addEventListener('click', function () {
+        ov.style.opacity = '0';
+        setTimeout(function () { ov.remove(); }, 320);
+        // Scan for already-connected gamepads after the iframe has focus
+        var pads = navigator.getGamepads ? navigator.getGamepads() : [];
+        var found = Array.from(pads).filter(Boolean).length;
+        log('Gamepad scan: ' + found + ' controller(s) active. Bridge polling.');
+        if (!found) log('No controller detected — press any button on your gamepad to register it.');
+      }, { once: true });
+
+      stage.appendChild(ov);
+    });
+    player.addEventListener('error', function (e) {
+      setStatus('err', 'ERROR — SEE LOG');
+      log('Ruffle error: ' + (e.detail || e));
+    });
+
+    // ── Debug controls ──────────────────────────────────────────────────────
+    document.querySelectorAll('[data-scale]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        document.querySelectorAll('[data-scale]').forEach(function (x) { x.classList.remove('on'); });
+        b.classList.add('on');
+        loadGame();
+        log('Scale → ' + b.dataset.scale);
+      });
+    });
+    document.querySelectorAll('[data-q]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        document.querySelectorAll('[data-q]').forEach(function (x) { x.classList.remove('on'); });
+        b.classList.add('on');
+        loadGame();
+        log('Quality → ' + b.dataset.q);
+      });
+    });
+    document.getElementById('db-fs').onclick = function () {
+      (player.requestFullscreen || document.documentElement.requestFullscreen.bind(document.documentElement))();
+    };
+    document.getElementById('db-reload').onclick = function () { loadGame(); log('Reloaded.'); };
+    document.getElementById('db-wipe').onclick = function () {
+      if (!confirm('Wipe SSF2 SW cache? Assets will re-download next play.')) return;
+      if (navigator.serviceWorker.controller)
+        navigator.serviceWorker.controller.postMessage({ type: 'clear-cache' });
+      fetch('http://localhost:7777/api/flash/cache-clear')
+        .then(function () { log('Disk cache cleared via server.'); })
+        .catch(function () { log('Server offline — only SW cache cleared.'); });
+      hits=0; fetched=0; updateCount();
+    };
+    document.getElementById('db-clr').onclick = function () { dbLog.textContent = ''; };
+
+    // Show disk cache count in debug panel
+    fetch('http://localhost:7777/api/flash/cache-status')
+      .then(function (r) { return r.json(); })
+      .then(function (d) { cInfo.textContent = (d.files || 0) + ' FILES ON DISK (' + ((d.bytes || 0)/1048576).toFixed(1) + ' MB)'; })
+      .catch(function () { cInfo.textContent = 'SERVER OFFLINE'; });
+  });
+
+  function currentScale()   { var a = document.querySelector('[data-scale].on'); return a ? a.dataset.scale : 'showAll'; }
+  function currentQuality() { var a = document.querySelector('[data-q].on');    return a ? a.dataset.q    : 'high';    }
+
+  document.addEventListener('keydown', function (e) {
+    if (e.key === '`' || e.key === 'F12') document.getElementById('dbg').classList.toggle('open');
+  });
+
+  // ── Gamepad Support ─────────────────────────────────────────────────────────
+  // DUAL STRATEGY:
+  //   1. Ruffle's native Flash GameInput API — auto-activates once the browser
+  //      grants gamepad access (allow="gamepad" is set by Kente's Korner).
+  //   2. Keyboard bridge (below) — translates controller buttons to SSF2 keyboard
+  //      input as a universal fallback that works regardless of Ruffle version.
+  //
+  // SSF2 DEFAULT KEYBOARD CONTROLS (configurable in OPTIONS → CONTROLS):
+  //   P1: Arrow keys · C=Jump · Z=Attack · X=Special · A=Shield · S=Grab · Enter=Pause
+  //   P2: WASD       · O=Jump · U=Attack · I=Special · [=Shield · P=Grab · Backspace=Pause
+  //
+  // CONTROLLER LAYOUT (standard W3C indices):
+  //   0=South(A/✕)  1=East(B/○)  2=West(X/□)  3=North(Y/△)
+  //   4=LB  5=RB  6=LT  7=RT  8=Select  9=Start/Options
+  //   12=D↑  13=D↓  14=D←  15=D→
+  (function () {
+    var DEADZONE = 0.38;
+
+    window.addEventListener('gamepadconnected', function (e) {
+      log('✓ Gamepad detected: ' + e.gamepad.id + ' [slot ' + e.gamepad.index + '] — bridge + Ruffle GameInput both active.');
+      setStatus('ok', '⚡ OFFLINE READY — CONTROLLER ACTIVE');
+    });
+
+    var MAPS = [
+      { // Gamepad 0 → Player 1
+        // NOTE: South=Jump matches how fighting game players expect PS/Xbox controllers.
+        // Remap freely in SSF2 OPTIONS > CONTROLS if you prefer a different layout.
+        btn: {
+          0: 'c',         // South (A/✕)     → C = Jump
+          1: 'z',         // East  (B/○)     → Z = Attack
+          2: 'x',         // West  (X/□)     → X = Special
+          3: 'a',         // North (Y/△)     → A = Shield/Dodge
+          4: 's',         // LB/L1           → S = Grab
+          5: 'd',         // RB/R1           → D = Taunt
+          6: 'a',         // LT/L2           → A = Shield (alt)
+          7: 's',         // RT/R2           → S = Grab (alt)
+          9: 'Enter',     // Start/Options   → Pause
+         12: 'ArrowUp',   13: 'ArrowDown',
+         14: 'ArrowLeft', 15: 'ArrowRight',
+        },
+        xKeys: ['ArrowLeft', 'ArrowRight'],
+        yKeys: ['ArrowUp',   'ArrowDown'],
+      },
+      { // Gamepad 1 → Player 2
+        btn: {
+          0: 'o',         // South (A/✕)     → O = Jump
+          1: 'u',         // East  (B/○)     → U = Attack
+          2: 'i',         // West  (X/□)     → I = Special
+          3: '[',         // North (Y/△)     → [ = Shield
+          4: 'p',         // LB/L1           → P = Grab
+          9: 'Backspace', // Start/Options   → Pause P2
+         12: 'w',         13: 's',
+         14: 'a',         15: 'd',
+        },
+        xKeys: ['a', 'd'],
+        yKeys: ['w', 's'],
+      },
+    ];
+
+    var _prev = {};
+
+    function fire(key, type) {
+      var code = key.startsWith('Arrow') ? key
+               : key === 'Enter'         ? 'Enter'
+               : key === 'Backspace'     ? 'Backspace'
+               : key.length === 1        ? 'Key' + key.toUpperCase()
+               : key;
+      var opts = { key: key, code: code, bubbles: true, cancelable: true, composed: true };
+      // Fire on window first — Ruffle attaches its keyboard handler at window level
+      window.dispatchEvent(new KeyboardEvent(type, opts));
+      // Also fire directly on the Ruffle player element for element-level listeners
+      if (player) player.dispatchEvent(new KeyboardEvent(type, opts));
+    }
+
+    function pollBridge() {
+      var pads = navigator.getGamepads ? navigator.getGamepads() : [];
+      for (var gi = 0; gi < MAPS.length; gi++) {
+        var gp = pads[gi];
+        if (!gp) continue;
+        var map = MAPS[gi];
+
+        // Buttons
+        Object.keys(map.btn).forEach(function (bi) {
+          var k = gi + '_b' + bi, key = map.btn[bi];
+          var on = gp.buttons[+bi] && gp.buttons[+bi].pressed;
+          if (on !== _prev[k]) { fire(key, on ? 'keydown' : 'keyup'); _prev[k] = on; }
+        });
+
+        // Left stick → directional keys
+        var ax = gp.axes[0] || 0, ay = gp.axes[1] || 0;
+        var xD = ax < -DEADZONE ? 0 : ax > DEADZONE ? 1 : -1;
+        var yD = ay < -DEADZONE ? 0 : ay > DEADZONE ? 1 : -1;
+        var pxD = _prev[gi+'_ax'] !== undefined ? _prev[gi+'_ax'] : -1;
+        if (xD !== pxD) {
+          if (pxD >= 0) fire(map.xKeys[pxD], 'keyup');
+          if (xD  >= 0) fire(map.xKeys[xD],  'keydown');
+          _prev[gi+'_ax'] = xD;
+        }
+        var pyD = _prev[gi+'_ay'] !== undefined ? _prev[gi+'_ay'] : -1;
+        if (yD !== pyD) {
+          if (pyD >= 0) fire(map.yKeys[pyD], 'keyup');
+          if (yD  >= 0) fire(map.yKeys[yD],  'keydown');
+          _prev[gi+'_ay'] = yD;
+        }
+      }
+      requestAnimationFrame(pollBridge);
+    }
+
+    if ('getGamepads' in navigator) {
+      requestAnimationFrame(pollBridge);
+      log('Gamepad bridge active. Layout: South=Jump · East=Attack · West=Special · North=Shield · LB=Grab');
+      log('Remap anytime in SSF2: OPTIONS > CONTROLS.');
+    } else {
+      log('⚠ Gamepad API unavailable. Make sure Kente Server is running and iframe has allow="gamepad".');
+    }
+
+    // ── postMessage relay from Kente parent page ──────────────────────────────
+    // Fallback for cross-origin contexts where navigator.getGamepads() is
+    // blocked inside the iframe.  Kente polls pads in the parent and relays
+    // state here.  Shares _prev with pollBridge — no double-firing.
+    window.addEventListener('message', function (e) {
+      var d = e.data;
+      if (!d || d.type !== 'kente-gamepad') return;
+      var gi = d.padIndex;
+      if (gi >= MAPS.length) return;
+      var map     = MAPS[gi];
+      var buttons = d.buttons || [];
+      var axes    = d.axes    || [];
+
+      // Buttons
+      Object.keys(map.btn).forEach(function (bi) {
+        var k = gi + '_b' + bi, key = map.btn[+bi];
+        var on = !!buttons[+bi];
+        if (on !== _prev[k]) { fire(key, on ? 'keydown' : 'keyup'); _prev[k] = on; }
+      });
+
+      // Left analog axes → directional keys
+      var ax = axes[0] || 0, ay = axes[1] || 0;
+      var xD = ax < -DEADZONE ? 0 : ax > DEADZONE ? 1 : -1;
+      var yD = ay < -DEADZONE ? 0 : ay > DEADZONE ? 1 : -1;
+
+      var pxD = _prev[gi+'_ax'] !== undefined ? _prev[gi+'_ax'] : -1;
+      if (xD !== pxD) {
+        if (pxD >= 0) fire(map.xKeys[pxD], 'keyup');
+        if (xD  >= 0) fire(map.xKeys[xD],  'keydown');
+        _prev[gi+'_ax'] = xD;
+      }
+      var pyD = _prev[gi+'_ay'] !== undefined ? _prev[gi+'_ay'] : -1;
+      if (yD !== pyD) {
+        if (pyD >= 0) fire(map.yKeys[pyD], 'keyup');
+        if (yD  >= 0) fire(map.yKeys[yD],  'keydown');
+        _prev[gi+'_ay'] = yD;
+      }
+    });
+    log('postMessage relay listener active — controller works even cross-origin.');
+  })();
+})();
+</script>
+</body>
+</html>
+

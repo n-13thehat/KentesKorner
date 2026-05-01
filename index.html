@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <!-- Defence-in-depth CSP. Blocks inline <script> (no XSS via injected
+       markup) while keeping the permissive media/iframe surface that the
+       theater providers and EmulatorJS rely on. -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self';
+                 script-src 'self';
+                 style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;
+                 font-src 'self' https://fonts.gstatic.com data:;
+                 img-src 'self' data: blob: https: http:;
+                 media-src 'self' blob: data: https: http:;
+                 connect-src 'self' https: http: ws: wss:;
+                 frame-src 'self' https: http: blob:;
+                 worker-src 'self' blob:;
+                 object-src 'none';
+                 base-uri 'self';
+                 form-action 'self';">
+  <title>KENTE'S KORNER — BUILD 01</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Share+Tech+Mono&family=Rajdhani:wght@300;400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="kente-app">
+
+    <!-- ═══════════════ SPLASH / PRESS START SCREEN ═══════════════ -->
+    <div id="splash" class="screen active">
+      <div class="crt-overlay"></div>
+      <div class="splash-content">
+        <img src="Conceptual Artifacts/KenteCorner Logo.png" alt="Kente's Korner" id="splash-logo-img">
+        <div class="press-start" id="press-start">PRESS START</div>
+        <div class="splash-build">BUILD 01 · DISC 01 · 2026</div>
+      </div>
+    </div>
+
+    <!-- ═══════════════ THE ROOM (Home Screen) ═══════════════ -->
+    <div id="room" class="screen">
+      <div id="room-bg"></div>
+      <div id="room-aberration"></div>
+      <div class="crt-overlay"></div>
+      <div id="room-vignette"></div>
+
+      <!-- Interactive TV zones — populated by kente.js -->
+      <div id="tv-zones"></div>
+
+      <!-- Top HUD -->
+      <div id="hud-top">
+        <div class="hud-brand">KENTE'S KORNER</div>
+        <div class="hud-right">
+          <button type="button" class="hud-dl-btn" id="hud-repo-btn" title="Kente's Repository (R)">
+            ⭐ REPO
+          </button>
+          <button type="button" class="hud-dl-btn" id="hud-dl-btn" title="Download Center">
+            ⬇ <span class="hud-dl-count" id="hud-dl-count"></span>
+          </button>
+          <div class="hud-build">BUILD 01 / DISC 01</div>
+          <div class="hud-dot" id="hud-status-dot"></div>
+        </div>
+      </div>
+
+      <!-- Bottom ticker -->
+      <div id="hud-ticker">
+        <!-- The track must contain TWO identical copies of the items.
+             The CSS animation translates by -50%, landing exactly at the
+             start of the second copy — which then loops back to 0 seamlessly.
+             Without duplication the animation jumps to a blank gap at every loop. -->
+        <div id="ticker-track">
+          <span class="tick">● SYSTEM READY</span>
+          <span class="tick">● NO SOURCE CONNECTED</span>
+          <span class="tick">● MOVE TO SELECT A CHANNEL</span>
+          <span class="tick">● KENTE CORE v1.0.0</span>
+          <span class="tick">● SACRIFICE CHAMBER AVAILABLE</span>
+          <span class="tick">● PRESS ENTER / A TO LAUNCH</span>
+          <!-- duplicate set — required for seamless ticker loop -->
+          <span class="tick" aria-hidden="true">● SYSTEM READY</span>
+          <span class="tick" aria-hidden="true">● NO SOURCE CONNECTED</span>
+          <span class="tick" aria-hidden="true">● MOVE TO SELECT A CHANNEL</span>
+          <span class="tick" aria-hidden="true">● KENTE CORE v1.0.0</span>
+          <span class="tick" aria-hidden="true">● SACRIFICE CHAMBER AVAILABLE</span>
+          <span class="tick" aria-hidden="true">● PRESS ENTER / A TO LAUNCH</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════ ZOOM FLASH OVERLAY ═══════════════ -->
+    <div id="zoom-flash"></div>
+
+    <!-- ═══════════════ MENU SCREENS ═══════════════ -->
+    <div id="menu-play"        class="menu-screen" data-tv="play"></div>
+    <div id="menu-collections" class="menu-screen" data-tv="collections"></div>
+    <div id="menu-sources"     class="menu-screen" data-tv="sources"></div>
+    <div id="menu-memory"      class="menu-screen" data-tv="memory"></div>
+    <div id="menu-theater"     class="menu-screen" data-tv="theater"></div>
+    <div id="menu-settings"    class="menu-screen" data-tv="settings"></div>
+
+    <!-- ═══════════════ EMULATOR OVERLAY ═══════════════ -->
+    <div id="emulator-overlay">
+      <div id="ejs-hud">
+        <button type="button" id="ejs-exit">✕ EXIT</button>
+        <div id="ejs-game-title"></div>
+        <div id="ejs-system-badge"></div>
+        <div id="ejs-cloud-badge" hidden>🌐 STREAMING</div>
+        <button type="button" id="ejs-ctrl-btn" hidden title="Open controller mapping">🎮 REMAP</button>
+        <button type="button" id="ejs-save-btn" hidden>↓ SAVE TO LIBRARY</button>
+      </div>
+      <div id="ejs-container"></div>
+
+      <!-- ── IN-GAME PAUSE MENU ─────────────────────────── -->
+      <div id="ingame-menu" aria-modal="true" role="dialog" aria-labelledby="igm-badge">
+        <div id="ingame-menu-inner">
+          <div id="igm-badge">PAUSED</div>
+          <div id="igm-title"></div>
+          <div id="igm-btns">
+            <button type="button" class="ingame-btn" id="igm-resume">▶&nbsp; RESUME</button>
+            <button type="button" class="ingame-btn" id="igm-close">✕&nbsp; CLOSE GAME</button>
+            <button type="button" class="ingame-btn" id="igm-mainmenu">⌂&nbsp; MAIN MENU</button>
+          </div>
+          <div id="igm-hint">
+            <span><kbd>PS</kbd> / <kbd>○</kbd> &mdash; RESUME</span>
+            <span><kbd>↕</kbd> &mdash; NAVIGATE</span>
+            <span><kbd>✕</kbd> / <kbd>ENTER</kbd> &mdash; SELECT</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════ ROM SCAN OVERLAY ═══════════════ -->
+    <div id="rom-scan-overlay">
+      <div id="rom-scan-content"></div>
+    </div>
+
+    <!-- Hidden ROM file input (fallback) — display controlled via CSS -->
+    <input type="file" id="rom-file-input" hidden
+      accept=".nes,.gb,.gbc,.gba,.sfc,.smc,.md,.bin,.gen,.sms,.a26,.a78,.n64,.z64,.v64,.pce,
+              .iso,.cue,.img,.cso,.chd,
+              .wbfs,.gcm,.nds,.3ds,.gcz,
+              .nsp,.xci,.nca,
+              .cdi,.gdi,
+              .zip,.7z,.rar"
+    >
+
+    <!-- ═══════════════ GAME DETAIL PANEL ═══════════════ -->
+    <div id="game-detail-panel">
+      <div id="gdp-inner"></div>
+    </div>
+
+    <!-- ═══════════════ LAUNCH OVERLAY ═══════════════ -->
+    <div id="launch-overlay">
+      <div id="launch-content"></div>
+    </div>
+
+    <!-- ═══════════════ SOURCE DETAIL PANEL ═══════════════ -->
+    <div id="source-detail-panel">
+      <div id="sdp-inner"></div>
+    </div>
+
+    <!-- ═══════════════ CLOUD BROWSER OVERLAY ═══════════════ -->
+    <div id="cloud-overlay">
+      <div id="cloud-panel">
+
+        <!-- Header -->
+        <div id="cloud-header">
+          <div id="cloud-header-left">
+            <span id="cloud-provider-icon"></span>
+            <div>
+              <div id="cloud-provider-name"></div>
+              <div id="cloud-provider-desc"></div>
+            </div>
+          </div>
+          <button type="button" id="cloud-close">✕ CLOSE</button>
+        </div>
+
+        <!-- System filter chips -->
+        <div id="cloud-systems"></div>
+
+        <!-- Search bar -->
+        <div id="cloud-search-bar">
+          <input id="cloud-search-input" type="text" placeholder="SEARCH TITLES..." autocomplete="off" spellcheck="false">
+          <button type="button" id="cloud-search-btn">SEARCH</button>
+        </div>
+
+        <!-- Results + file detail split -->
+        <div id="cloud-body">
+
+          <div id="cloud-results-pane">
+            <div id="cloud-results-label">RESULTS</div>
+            <div id="cloud-results-list">
+              <p class="cloud-empty">SELECT A SYSTEM AND SEARCH.</p>
+            </div>
+          </div>
+
+          <div id="cloud-files-pane">
+            <div id="cloud-files-label">FILES</div>
+            <div id="cloud-files-list">
+              <p class="cloud-empty">SELECT A RESULT TO SEE FILES.</p>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- Download progress bar -->
+        <div id="cloud-download-bar" class="hidden">
+          <div id="cloud-download-label">DOWNLOADING...</div>
+          <div id="cloud-progress-track"><div id="cloud-progress-fill"></div></div>
+          <div id="cloud-download-pct">0%</div>
+          <button type="button" id="cloud-play-now-btn" hidden>▶ PLAY NOW</button>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- ═══════════════ DOWNLOAD CONTROL CENTER ═══════════════ -->
+    <div id="downloads-overlay">
+      <div id="dl-panel">
+        <div id="dl-header">
+          <div id="dl-title">⬇ DOWNLOADS</div>
+          <div id="dl-subtitle">Background downloads · Ready to play</div>
+          <button type="button" id="dl-close">✕</button>
+        </div>
+        <div id="dl-list">
+          <p class="dl-empty">NO DOWNLOADS YET.<br><span style="font-size:9px;opacity:0.5">CLICK ANY GAME TO DOWNLOAD IN THE BACKGROUND</span></p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════ KENTE'S REPOSITORY ═══════════════ -->
+    <div id="repo-overlay">
+      <div id="repo-panel">
+        <div id="repo-header">
+          <div id="repo-header-text">
+            <div id="repo-title">⭐ KENTE'S REPO</div>
+            <div id="repo-subtitle">n-13thehat/KentesKorner · GitHub</div>
+          </div>
+          <button type="button" id="repo-close">✕</button>
+        </div>
+        <div id="repo-list">
+          <p class="repo-empty">LOADING REPOSITORY...</p>
+        </div>
+        <div id="repo-footer">
+          <a href="https://github.com/n-13thehat/KentesKorner" target="_blank" rel="noopener noreferrer" id="repo-gh-link">
+            ⊕ &nbsp;OPEN ON GITHUB
+          </a>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════ SACRIFICE CHAMBER ═══════════════ -->
+    <div id="sacrifice-screen" class="screen">
+      <div class="crt-overlay"></div>
+      <div id="sac-content"></div>
+    </div>
+
+    <!-- Gamepad indicator — shown only when a controller is connected -->
+    <div id="gp-indicator" hidden>🎮 <span id="gp-count">1</span></div>
+
+    <!-- ═══════════════ CALIBRATION OVERLAY ═══════════════ -->
+    <div id="calibration-overlay">
+      <div id="cal-panel">
+        <div id="cal-header">
+          <div id="cal-title">⚙ CONTROLLER CALIBRATION</div>
+          <button type="button" id="cal-close">✕ CLOSE</button>
+        </div>
+        <div id="cal-devices"><!-- device chips injected by JS --></div>
+        <div id="cal-wizard"><!-- wizard steps injected by JS --></div>
+      </div>
+    </div>
+
+    <!-- ═══════════════ CAMERA / VR / WII POINTER ═══════════════ -->
+    <!-- Hidden video feed for camera processing -->
+    <video id="cam-feed" autoplay playsinline muted hidden></video>
+    <!-- Downsampled canvas for optical-flow motion detection -->
+    <canvas id="cam-canvas" width="80" height="60" hidden></canvas>
+    <!-- Wii pointer crosshair (visible only when wiiPointer is ON) -->
+    <div id="wii-cursor" hidden>
+      <div class="wii-cursor-h"></div>
+      <div class="wii-cursor-v"></div>
+    </div>
+    <!-- DualSense touchpad cursor (visible only when touchpad cursor mode is ON) -->
+    <div id="ds-cursor" hidden>
+      <div class="ds-cursor-ring"></div>
+      <div class="ds-cursor-dot"></div>
+    </div>
+    <!-- Camera / VR active badge -->
+    <div id="cam-indicator" hidden>
+      <span id="cam-indicator-vr">👁 VR</span>
+      <span id="cam-indicator-wii">🎯 WII</span>
+    </div>
+
+
+    <!-- ═══════════════ THEATER DETAIL PANEL ═══════════════ -->
+    <!-- Full-screen detail view shown when a poster card is opened. -->
+    <div id="theater-detail-overlay" class="theater-detail-overlay" hidden></div>
+
+    <!-- ═══════════════ THEATER VIDEO PLAYER ═══════════════ -->
+    <!-- Custom HLS player. Replaces the previous YouTube iframe so we can
+         pipe lookmovie's m3u8 streams through /api/theater/proxy. -->
+    <div id="theater-video-overlay">
+      <div id="theater-video-panel">
+        <div id="theater-video-header">
+          <div id="theater-video-title"><span class="tvp-title-track">VIDEO</span></div>
+          <span id="theater-video-meta" class="tvp-header-meta" hidden></span>
+          <button type="button" id="theater-video-mini" title="Mini-player">⬓ MINI</button>
+          <button type="button" id="theater-video-close">✕ CLOSE</button>
+        </div>
+        <div id="theater-video-stage">
+          <video id="theater-video" playsinline preload="metadata"></video>
+          <img id="theater-watermark" class="theater-wm"
+               src="Conceptual%20Artifacts/KenteCorner%20Logo.png"
+               alt="" aria-hidden="true" draggable="false">
+          <div id="theater-video-loading" class="tvp-loading" hidden>
+            <div class="tvp-spinner"></div>
+            <div class="tvp-loading-label">BUFFERING…</div>
+          </div>
+          <div id="theater-video-error" class="tvp-error" hidden></div>
+          <div id="theater-video-controls" class="tvp-controls">
+            <div class="tvp-scrub-row">
+              <div class="tvp-scrub" id="tvp-scrub">
+                <div class="tvp-scrub-buf"></div>
+                <div class="tvp-scrub-fill"></div>
+                <div class="tvp-scrub-handle"></div>
+              </div>
+            </div>
+            <div class="tvp-btn-row">
+              <button type="button" class="tvp-btn tvp-btn-sm tvp-btn-disabled" id="tvp-prev-ep" aria-label="Previous Episode" title="Previous Episode" hidden>⏮</button>
+              <button type="button" class="tvp-btn" id="tvp-play" aria-label="Play / Pause">▶</button>
+              <button type="button" class="tvp-btn tvp-btn-sm tvp-btn-disabled" id="tvp-next-ep" aria-label="Next Episode" title="Next Episode" hidden>⏭</button>
+              <button type="button" class="tvp-btn tvp-btn-sm" id="tvp-back" aria-label="Back 10 seconds">⟲ 10</button>
+              <button type="button" class="tvp-btn tvp-btn-sm" id="tvp-fwd"  aria-label="Forward 10 seconds">10 ⟳</button>
+              <div class="tvp-time"><span id="tvp-cur">0:00</span> / <span id="tvp-dur">0:00</span></div>
+              <div class="tvp-spacer"></div>
+              <div class="tvp-vol">
+                <button type="button" class="tvp-btn tvp-btn-sm" id="tvp-mute" aria-label="Mute">🔊</button>
+                <input type="range" id="tvp-vol-slider" min="0" max="1" step="0.01" value="1">
+              </div>
+              <select id="tvp-quality" class="tvp-select" title="Quality"></select>
+              <div id="tvp-source-slot" class="tvp-source-slot"></div>
+              <button type="button" class="tvp-btn tvp-btn-sm" id="tvp-speed" aria-label="Playback Speed" title="Playback Speed">1×</button>
+              <button type="button" class="tvp-btn tvp-btn-sm tvp-btn-disabled" id="tvp-cc" aria-label="Closed Captions" title="Subtitles">CC</button>
+              <button type="button" class="tvp-btn tvp-btn-sm" id="tvp-pip"  aria-label="Picture in Picture">⧉</button>
+              <button type="button" class="tvp-btn tvp-btn-sm" id="tvp-full" aria-label="Fullscreen">⛶</button>
+            </div>
+          </div>
+
+          <!-- ── HELP OVERLAY (SELECT button) ─────────────────── -->
+          <!-- Toggled with SELECT on the gamepad while playback is active.
+               Lists controller bindings so first-time users learn the chrome. -->
+          <div id="tvp-help-overlay" aria-hidden="true">
+            <div class="tvp-help-card">
+              <div class="tvp-help-title">PLAYER CONTROLS</div>
+              <div class="tvp-help-grid">
+                <span><kbd>✕ / A</kbd></span><span>PLAY / PAUSE</span>
+                <span><kbd>○ / B</kbd></span><span>PAUSE MENU</span>
+                <span><kbd>← →</kbd></span><span>SEEK ±10s</span>
+                <span><kbd>↑ ↓</kbd></span><span>VOLUME</span>
+                <span><kbd>L1 R1</kbd></span><span>PREV / NEXT EPISODE</span>
+                <span><kbd>UP NEXT</kbd></span><span>AUTO-PLAY IN LAST 15s</span>
+                <span><kbd>SELECT</kbd></span><span>TOGGLE THIS HELP</span>
+                <span><kbd>START</kbd></span><span>PAUSE MENU</span>
+              </div>
+              <div class="tvp-help-foot">PRESS <kbd>SELECT</kbd> TO CLOSE</div>
+            </div>
+          </div>
+
+          <!-- ── UP NEXT CARD ───────────────────────────────────
+               Floating bottom-right card shown in the final 15 s of an
+               episode when there's a next entry in epList. Counts down
+               to auto-play; PLAY NOW jumps immediately, CANCEL dismisses
+               for the rest of this episode. HLS native sessions only —
+               embed iframes have no native <video> tail to detect. -->
+          <div id="tvp-up-next" aria-hidden="true">
+            <div class="tvp-un-card">
+              <div class="tvp-un-label">UP NEXT IN <span id="tvp-un-secs">10</span>S</div>
+              <div class="tvp-un-row">
+                <div class="tvp-un-poster" id="tvp-un-poster"></div>
+                <div class="tvp-un-info">
+                  <div class="tvp-un-ep" id="tvp-un-ep">S1 · E2</div>
+                  <div class="tvp-un-title" id="tvp-un-title">EPISODE</div>
+                </div>
+                <svg class="tvp-un-ring" viewBox="0 0 36 36" aria-hidden="true">
+                  <circle class="tvp-un-ring-bg" cx="18" cy="18" r="15.9"></circle>
+                  <circle class="tvp-un-ring-fg" cx="18" cy="18" r="15.9"></circle>
+                </svg>
+              </div>
+              <div class="tvp-un-btns">
+                <button type="button" class="tvp-un-btn tvp-un-btn-primary" id="tvp-un-play">▶ PLAY NOW</button>
+                <button type="button" class="tvp-un-btn" id="tvp-un-cancel">✕ CANCEL</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- ── THEATER PAUSE MENU ─────────────────────────── -->
+          <div id="theater-pause-menu" aria-modal="true" role="dialog" aria-labelledby="tpm-badge">
+            <div id="theater-pause-inner">
+              <div id="tpm-badge">PAUSED</div>
+              <div id="tpm-title"></div>
+              <div id="tpm-btns">
+                <button type="button" class="tpm-btn" id="tpm-resume">▶&nbsp; RESUME</button>
+                <button type="button" class="tpm-btn" id="tpm-source" hidden>↻&nbsp; NEXT SOURCE</button>
+                <button type="button" class="tpm-btn" id="tpm-mini">⬓&nbsp; MINI-PLAYER</button>
+                <button type="button" class="tpm-btn" id="tpm-close">✕&nbsp; CLOSE PLAYER</button>
+              </div>
+              <div id="tpm-hint">
+                <span><kbd>START</kbd> / <kbd>○</kbd> &mdash; RESUME</span>
+                <span><kbd>↕</kbd> &mdash; NAVIGATE</span>
+                <span><kbd>✕</kbd> / <kbd>ENTER</kbd> &mdash; SELECT</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════ ATTRACT MODE OVERLAY ═══════════════ -->
+    <div id="attract-overlay">
+      <div id="attract-content">
+        <div id="attract-logo">KENTE'S KORNER</div>
+        <div id="attract-now-playing">NOW SHOWING</div>
+        <div id="attract-title">LOADING...</div>
+        <div id="attract-sys"></div>
+        <div id="attract-press">PRESS ANY KEY TO CONTINUE</div>
+      </div>
+    </div>
+
+    <!-- Matrix code rain — shown only under [data-theme="matrix"] -->
+    <canvas id="matrix-rain" hidden></canvas>
+    <!-- Matrix exit transition — full-screen wipe when leaving menus -->
+    <canvas id="matrix-exit-rain" hidden></canvas>
+
+    <!-- ── Guide Overlay — USB Boot Guide + PS4 Console Mod ── -->
+    <!-- Populated dynamically by openGuide(type) in kente.js   -->
+    <div id="guide-overlay" role="dialog" aria-modal="true" aria-label="Guide">
+      <div id="guide-panel"></div>
+    </div>
+
+  </div><!-- /#kente-app -->
+
+  <!-- hls.js (light build) — vendored locally so the Theater works offline on
+       Batocera kiosks where outbound HTTPS may be blocked. -->
+  <script defer src="vendor/hls.light.min.js"></script>
+  <script defer src="library.js?v=6"></script>
+  <script defer src="js/rom_db.js?v=1"></script>
+  <script defer src="kente.js?v=6"></script>
+</body>
+</html>
+

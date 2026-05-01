@@ -1,0 +1,8 @@
+{
+  "name": "Example Skin Pack",
+  "author": "YourNameHere",
+  "version": "1.0",
+  "description": "Template mod — replace this with your actual DAT*.ssf files.",
+  "characters": ["Mario"],
+  "files": []
+}

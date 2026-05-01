@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>KENTE'S KORNER</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  :root{
+    --gold:#e8a000;--red:#cc2222;--green:#1db954;
+    --bg:#04040c;--fg:#f0e8d0;
+  }
+  body{
+    background:var(--bg);color:var(--fg);
+    font-family:'Courier New',Courier,monospace;
+    width:100vw;height:100vh;overflow:hidden;
+    display:flex;flex-direction:column;align-items:center;justify-content:center;
+    user-select:none;
+  }
+
+  /* ── KENTE WEAVE ── */
+  #weave{
+    position:fixed;inset:0;
+    display:grid;
+    grid-template-columns:repeat(20,1fr);
+    grid-template-rows:repeat(12,1fr);
+    opacity:0;transition:opacity 0.6s;
+    pointer-events:none;
+  }
+  #weave.show{opacity:1}
+  #weave.dim{opacity:0.07;transition:opacity 1.2s}
+  .strip{transform:scaleX(0);transform-origin:left center;transition:transform 0.4s ease}
+  .strip.in{transform:scaleX(1)}
+
+  /* ── SCANLINES ── */
+  #scanlines{
+    position:fixed;inset:0;pointer-events:none;
+    background:repeating-linear-gradient(
+      180deg,transparent,transparent 2px,rgba(0,0,0,0.18) 2px,rgba(0,0,0,0.18) 4px
+    );
+    mix-blend-mode:multiply;
+  }
+
+  /* ── LOGO ── */
+  #logo{
+    position:relative;z-index:10;text-align:center;
+    opacity:0;transform:scale(0.92);
+    transition:opacity 0.8s ease,transform 0.8s ease;
+  }
+  #logo.show{opacity:1;transform:scale(1)}
+  .logo-main{
+    font-size:clamp(40px,8vw,88px);font-weight:900;
+    letter-spacing:0.18em;line-height:1;
+    color:var(--gold);
+    text-shadow:0 0 40px rgba(232,160,0,0.6),0 0 80px rgba(232,160,0,0.25);
+  }
+  .logo-sub{
+    font-size:clamp(14px,2.5vw,26px);letter-spacing:0.55em;
+    color:var(--fg);opacity:0.7;margin-top:8px;
+  }
+  .logo-build{
+    font-size:clamp(9px,1.2vw,13px);letter-spacing:0.35em;
+    color:var(--gold);opacity:0.45;margin-top:18px;
+  }
+
+  /* ── STATUS LINE ── */
+  #status{
+    position:fixed;bottom:10vh;z-index:10;text-align:center;
+    font-size:clamp(9px,1.1vw,12px);letter-spacing:0.28em;
+    color:var(--fg);opacity:0;transition:opacity 0.6s;
+  }
+  #status.show{opacity:0.55}
+  #status-dot{
+    display:inline-block;width:6px;height:6px;border-radius:50%;
+    background:var(--gold);margin-right:8px;vertical-align:middle;
+    animation:pulse 1.2s ease-in-out infinite;
+  }
+  @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:0.3;transform:scale(0.7)}}
+
+  /* ── FADE OVERLAY ── */
+  #fade{
+    position:fixed;inset:0;background:var(--bg);z-index:99;
+    opacity:0;pointer-events:none;transition:opacity 0.9s ease;
+  }
+  #fade.active{opacity:1;pointer-events:all}
+</style>
+</head>
+<body>
+
+<div id="weave"></div>
+<div id="scanlines"></div>
+
+<div id="logo">
+  <div class="logo-main">KENTE'S<br>KORNER</div>
+  <div class="logo-sub">THE ROOM</div>
+  <div class="logo-build">BUILD 01 &nbsp;·&nbsp; DISC 01</div>
+</div>
+
+<div id="status"><span id="status-dot"></span><span id="status-text">INITIALIZING SYSTEM...</span></div>
+<div id="fade"></div>
+
+<script>
+(function(){
+  const COLORS = [
+    '#e8a000','#cc2222','#1a6e3c','#1a1a8c',
+    '#e8a000','#b87000','#8B0000','#0a4a2a',
+    '#e8d000','#cc4400','#006622','#001488',
+  ];
+  const KENTE_URL = 'http://localhost:7777';
+  const weave = document.getElementById('weave');
+  const logo  = document.getElementById('logo');
+  const status= document.getElementById('status');
+  const fade  = document.getElementById('fade');
+  const stTxt = document.getElementById('status-text');
+
+  // Build weave grid strips
+  const cols=20, rows=12;
+  for(let r=0;r<rows;r++){
+    for(let c=0;c<cols;c++){
+      const d = document.createElement('div');
+      d.className='strip';
+      // Kente pattern: alternating color bands by row/col parity
+      const ci = (r + c*3) % COLORS.length;
+      d.style.background = COLORS[ci];
+      d.style.opacity = (r % 3 === 0 || c % 4 === 0) ? '0.9' : '0.2';
+      d.style.transitionDelay = (c * 22 + r * 8) + 'ms';
+      weave.appendChild(d);
+    }
+  }
+
+  // ── SEQUENCE ──────────────────────────────────────────────────
+  let pollTimer = null;
+
+  function step1_weaveIn(){
+    weave.classList.add('show');
+    requestAnimationFrame(() => {
+      weave.querySelectorAll('.strip').forEach(s => s.classList.add('in'));
+    });
+    setTimeout(step2_dimAndLogo, 900);
+  }
+
+  function step2_dimAndLogo(){
+    weave.classList.add('dim');
+    setTimeout(() => logo.classList.add('show'), 300);
+    setTimeout(step3_status, 900);
+  }
+
+  function step3_status(){
+    status.classList.add('show');
+    pollServer();
+  }
+
+  function pollServer(){
+    fetch(KENTE_URL + '/api/ping', {signal: AbortSignal.timeout(1200)})
+      .then(r => r.ok ? r.json() : Promise.reject())
+      .then(data => {
+        if(data.mode === 'native'){
+          stTxt.textContent = 'SYSTEM READY — ENTERING THE ROOM';
+          setTimeout(transitionToApp, 700);
+        } else {
+          retry();
+        }
+      })
+      .catch(() => retry());
+  }
+
+  function retry(){
+    pollTimer = setTimeout(pollServer, 800);
+  }
+
+  function transitionToApp(){
+    clearTimeout(pollTimer);
+    fade.classList.add('active');
+    setTimeout(() => { window.location.href = KENTE_URL; }, 950);
+  }
+
+  // Start immediately
+  setTimeout(step1_weaveIn, 180);
+})();
+</script>
+</body>
+</html>
+

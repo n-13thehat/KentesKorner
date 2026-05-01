@@ -1,0 +1,62 @@
+appId: com.kentecorner.app
+productName: "Kente's Korner"
+
+# Source root is the repo root
+directories:
+  output: dist
+
+# ── Files included in the app bundle ────────────────────────────────────────
+# Only the runtime-needed web/JS files are packaged.
+# roms/, bios/, saves/ live in %APPDATA%/KenteCorner/ at runtime (created by server).
+# The server (kente-server.exe) and Dolphin arrive via extraResources (see below).
+# BEFORE running `npm run build`, always run `npm run build:server` first to
+# recompile batocera/kente-server.py → resources/kente-server.exe (requires PyInstaller).
+files:
+  - "electron/**"
+  - "index.html"
+  - "kente.js"
+  - "library.js"
+  - "style.css"
+  - "games/**"
+  - "mods/**"
+  - "!batocera/**"
+  - "!build/**"
+  - "!bios/**"
+  - "!roms/**"
+  - "!dist/**"
+  - "!node_modules/**"
+  - "!resources/dolphin/**"
+  - "!resources/kente-server.exe"
+
+# ── Extra resources bundled outside the asar archive ────────────────────────
+# Placed in <install>/resources/ and accessed via process.resourcesPath.
+extraResources:
+  - from: "resources/kente-server.exe"
+    to:   "kente-server.exe"
+  - from: "resources/dolphin"
+    to:   "dolphin"
+    filter:
+      - "**/*"
+
+# ── Windows ──────────────────────────────────────────────────────────────────
+win:
+  target:
+    - target: nsis
+      arch:   [x64]
+  icon: "resources/KenteCorner.ico"
+  requestedExecutionLevel: asInvoker
+
+nsis:
+  oneClick:                        false
+  allowToChangeInstallationDirectory: true
+  installerIcon:                   "resources/KenteCorner.ico"
+  uninstallerIcon:                 "resources/KenteCorner.ico"
+  installerHeaderIcon:             "resources/KenteCorner.ico"
+  createDesktopShortcut:           always
+  createStartMenuShortcut:         true
+  shortcutName:                    "Kente's Korner"
+
+publish:
+  provider: github
+  owner:    n-13thehat
+  repo:     KentesKorner

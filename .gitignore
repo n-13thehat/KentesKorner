@@ -1,0 +1,34 @@
+# ── Node / Electron ──────────────────────────────────────────────────────────
+node_modules/
+dist/
+
+# ── Bundled binaries (populated at build time, not committed) ────────────────
+# Place Dolphin portable here before building: resources/dolphin/Dolphin.exe + dlls + Sys/
+resources/dolphin/
+!resources/dolphin/.gitkeep
+# Compiled Python server (produced by `npm run build:server`)
+resources/kente-server.exe
+
+# ── User data (lives in %APPDATA%/KenteCorner/ at runtime) ──────────────────
+roms/
+saves/
+bios/
+
+# ── Python build artifacts ───────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+build/kente-server/
+*.spec
+
+# ── OS noise ─────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── EJS community core cache (downloaded on first Dreamcast launch) ───────────
+ejs-cores/
+
+# ── Scratch / one-off debug files ────────────────────────────────────────────
+tmp_*
+.tmp_*

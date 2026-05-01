@@ -1,0 +1,43 @@
+SSF2 MOD FOLDER — HOW TO ADD A MOD
+====================================
+
+Each mod is a sub-folder inside  mods/ssf2/
+
+  mods/
+  └── ssf2/
+      ├── ExampleSkin/          ← template (rename this)
+      │   ├── mod.json          ← metadata (optional but recommended)
+      │   └── DAT123.ssf        ← replacement data file(s)
+      └── MyActualMod/
+          ├── mod.json
+          ├── DAT001.ssf
+          └── DAT002.ssf
+
+mod.json fields
+---------------
+  name         Display name shown in the Mod Manager
+  author       Your name / handle
+  version      Version string (e.g. "1.0")
+  description  One-line description shown under the mod name
+  characters   Array of character names the mod affects (informational)
+  files        Leave as [] — the server auto-detects all DAT*.ssf files
+
+How to apply a mod
+------------------
+1. Drop your DAT*.ssf files into a sub-folder here (alongside mod.json)
+2. In Kente's Korner, open SSF2 → click "MODS"
+3. Select your mod and click APPLY
+
+The server will:
+  • Back up the original files to  mods/ssf2/_backup/  (first apply only)
+  • Copy your mod files into the SSF2 data directory
+  • Originals are always preserved — click RESTORE ORIGINALS to revert
+
+Where to find SSF2 DAT files
+-----------------------------
+  Windows:  C:\Program Files (x86)\Super Smash Flash 2 Beta\
+  Linux:    ~/ssf2/data/data/
+
+DAT file → character mapping is version-specific (Beta v1.4).
+Check the SSF2 modding community on Reddit or the McLeodGaming forums
+for character-to-DAT file indexes.
