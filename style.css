@@ -506,6 +506,19 @@ body { font-family: var(--font-ui); color: var(--text); }
   color: var(--menu-accent, var(--brand));
   background: rgba(255,255,255,0.04);
 }
+.library-search {
+  font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.15em;
+  padding: 5px 10px; min-width: 180px; flex: 0 0 auto;
+  background: transparent; border: 1px solid var(--border);
+  color: var(--text); outline: none;
+  transition: all var(--transition-fast);
+  margin-left: auto;
+}
+.library-search::placeholder { color: var(--text-dim); letter-spacing: 0.15em; }
+.library-search:focus {
+  border-color: var(--menu-accent, var(--brand));
+  color: var(--menu-accent, var(--brand));
+}
 
 
 /* ════════════════════════════════════════
@@ -1897,6 +1910,7 @@ body[data-theme="copper"] {
 }
 .cloud-dl-btn:hover   { background: var(--brand); color: #000; }
 .cloud-dl-btn.success { background: #1db954; border-color: #1db954; color: #000; pointer-events: none; }
+.cloud-dl-btn.queued  { background: var(--brand); border-color: var(--brand); color: #000; opacity: 0.65; pointer-events: none; }
 .cloud-dl-btn.busy    { opacity: 0.4; pointer-events: none; }
 
 /* Download progress */
@@ -3483,6 +3497,16 @@ body[data-theme="copper"] {
   border-color: var(--amber, #ffb86b);
   color: var(--amber, #ffb86b);
   background: rgba(255,184,107,0.08);
+}
+.tpm-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.tpm-btn:disabled:hover,
+.tpm-btn:disabled.tpm-focused {
+  border-color: var(--border, #1a1a2e);
+  color: var(--text, #888);
+  background: var(--panel, #0b0b1e);
 }
 #tpm-resume.tpm-focused {
   background: rgba(255,184,107,0.12);

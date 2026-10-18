@@ -21,6 +21,7 @@ const SERVER_TIMEOUT = 30_000;   // ms to wait for server to boot
 
 let mainWindow    = null;
 let serverProcess = null;
+let _theaterActive = false;   // set via IPC; gates the window-open + will-navigate handlers
 
 // ── Discord Rich Presence ─────────────────────────────────────────────────────
 // Requires artkeys.json  →  { "discordAppId": "YOUR_APPLICATION_ID" }
@@ -83,6 +84,12 @@ function resourcePath(...parts) {
 
 /** Find the server executable or fall back to running the .py script. */
 function resolveServer() {
+  // Dev mode: prefer the Python script so backend edits take effect immediately.
+  // Set KENTE_USE_EXE_SERVER=1 to force the bundled exe even in dev.
+  if (!app.isPackaged && process.env.KENTE_USE_EXE_SERVER !== '1') {
+    const py = path.join(__dirname, '..', 'batocera', 'kente-server.py');
+    return { cmd: 'python', args: [py] };
+  }
   const exe = resourcePath('kente-server.exe');
   if (fs.existsSync(exe)) return { cmd: exe, args: [] };
   // Dev fallback — requires Python 3 in PATH
@@ -94,11 +101,23 @@ function resolveServer() {
 
 function startServer() {
   const { cmd, args } = resolveServer();
+  // PyInstaller onefile executables unpack to %TEMP% by default. On some
+  // kiosk/locked-down setups this can fail. Force a temp dir under userData
+  // so the bundled server can always unpack without admin rights.
+  const pyiTmp = path.join(app.getPath('userData'), 'pyi-tmp');
+  try { fs.mkdirSync(pyiTmp, { recursive: true }); } catch {}
   const env = {
     ...process.env,
     KENTE_APP_MODE:     'electron',
     KENTE_DATA_DIR:     path.join(app.getPath('userData'), 'KenteCorner'),
+    TEMP:               pyiTmp,
+    TMP:                pyiTmp,
     KENTE_DOLPHIN_PATH: resourcePath('dolphin', 'Dolphin.exe'),
+    // Web assets live outside the asar so the bundled python server can
+    // read them.  In dev (unpackaged) we point at the repo root.
+    KENTE_WEB_DIR:      app.isPackaged
+                          ? resourcePath('web')
+                          : path.join(__dirname, '..'),
   };
 
   console.log('[kente] Starting server:', cmd, args.join(' '));
@@ -160,10 +179,51 @@ function createWindow() {
 
   mainWindow.loadURL(`http://localhost:${SERVER_PORT}`);
 
-  // Open external links in the default browser, not in Electron
+  // F11 fullscreen toggle (works even when focus is inside an iframe).
+  mainWindow.webContents.on('before-input-event', (event, input) => {
+    if (input.type !== 'keyDown') return;
+    if (input.key !== 'F11') return;
+    event.preventDefault();
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.setFullScreen(!mainWindow.isFullScreen());
+  });
+
+  // Keep renderer state synced when fullscreen changes via F11 or OS controls.
+  mainWindow.on('enter-full-screen', () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.webContents.send('kente:window:fullScreenChanged', true);
+  });
+  mainWindow.on('leave-full-screen', () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.webContents.send('kente:window:fullScreenChanged', false);
+  });
+
+  // Open external links in the default browser, not in Electron — but
+  // suppress them while the Theater is active. Ad scripts inside embed
+  // iframes call window.open(adUrl), which Electron turns into
+  // shell.openExternal and pops the user's default browser. The renderer
+  // sets _theaterActive via IPC whenever the theater overlay is showing.
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith('http')) shell.openExternal(url);
+    if (_theaterActive) return { action: 'deny' };
+    // Strict protocol check — startsWith('http') alone would also match
+    // weird custom schemes like httpfoo:// that a malicious embed could
+    // craft to bounce through the OS handler.
+    if (url.startsWith('http://') || url.startsWith('https://')) {
+      shell.openExternal(url);
+    }
     return { action: 'deny' };
+  });
+
+  // Block ad-driven top-frame redirects while the Theater is active. An
+  // iframe ad doing `top.location = adUrl` would otherwise navigate the
+  // whole app away from the loaded http://localhost server URL.
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (!_theaterActive) return;
+    try {
+      const u = new URL(url);
+      if (u.hostname === 'localhost' || u.hostname === '127.0.0.1') return;
+    } catch {}
+    event.preventDefault();
   });
 
   mainWindow.on('closed', () => { mainWindow = null; });
@@ -201,6 +261,54 @@ ipcMain.on('kente:showWindow', () => {
     // Emulator exited — tell renderer to reset Discord presence to "Browsing"
     mainWindow.webContents.send('kente:discord:reset');
   }
+});
+
+/**
+ * Renderer → main: toggle the "theater is on screen" flag. While true,
+ * setWindowOpenHandler refuses to forward URLs to the system browser and
+ * will-navigate blocks any non-localhost top-frame navigation. This is
+ * what stops embed-iframe ad scripts from popping the user's browser.
+ */
+ipcMain.on('kente:theater:setActive', (_, active) => {
+  _theaterActive = !!active;
+});
+
+// ── Window controls ─────────────────────────────────────────────────────────-
+ipcMain.on('kente:window:setFullScreen', (_, flag) => {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.setFullScreen(!!flag);
+});
+ipcMain.on('kente:window:toggleFullScreen', () => {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.setFullScreen(!mainWindow.isFullScreen());
+});
+
+// ── Cursor-mode input injection (Electron only) ─────────────────────────────
+function _clampToWindow(x, y) {
+  if (!mainWindow || mainWindow.isDestroyed()) return { x: 0, y: 0 };
+  const [w, h] = mainWindow.getContentSize();
+  const nx = Number.isFinite(Number(x)) ? Number(x) : 0;
+  const ny = Number.isFinite(Number(y)) ? Number(y) : 0;
+  const cx = Math.max(0, Math.min(Math.max(0, w - 1), nx));
+  const cy = Math.max(0, Math.min(Math.max(0, h - 1), ny));
+  return { x: cx, y: cy };
+}
+
+ipcMain.on('kente:input:mouseMove', (_, pos) => {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const { x, y } = _clampToWindow(pos?.x, pos?.y);
+  if (!mainWindow.isFocused()) mainWindow.focus();
+  mainWindow.webContents.sendInputEvent({ type: 'mouseMove', x, y, movementX: 0, movementY: 0 });
+});
+
+ipcMain.on('kente:input:mouseClick', (_, pos) => {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const { x, y } = _clampToWindow(pos?.x, pos?.y);
+  if (!mainWindow.isFocused()) mainWindow.focus();
+  // Ensure the pointer is "at" the target before the click.
+  mainWindow.webContents.sendInputEvent({ type: 'mouseMove', x, y, movementX: 0, movementY: 0 });
+  mainWindow.webContents.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+  mainWindow.webContents.sendInputEvent({ type: 'mouseUp',   x, y, button: 'left', clickCount: 1 });
 });
 
 // Renderer → main: update Discord Rich Presence activity
@@ -253,7 +361,17 @@ function setupAutoUpdater() {
       console.warn('[kente] Auto-update check failed (continuing):', err.message);
     });
 
-    autoUpdater.checkForUpdates().catch(() => {});
+    // Offline-friendly: only attempt an update check when we appear to have WAN.
+    // Prevents noisy Chromium TLS handshake errors on offline cabinets.
+    const dns = require('dns');
+    let done = false;
+    const finish = (ok) => {
+      if (done) return;
+      done = true;
+      if (ok) autoUpdater.checkForUpdates().catch(() => {});
+    };
+    const tid = setTimeout(() => finish(false), 1200);
+    dns.lookup('github.com', err => { clearTimeout(tid); finish(!err); });
   } catch (err) {
     console.warn('[kente] electron-updater not available:', err.message);
   }
@@ -278,6 +396,42 @@ function ensureEmulatorDeps() {
   req.end(body);
 }
 
+/**
+ * Prefetch EmulatorJS stable assets + cores into the local cache so
+ * browser-based systems (SNES/GBA/etc.) work offline after the first run.
+ * Safe to call repeatedly; the server skips files already on disk.
+ */
+function ensureEmulatorJSOfflinePack() {
+  const body = '{}';
+  const req  = http.request(
+    { hostname: 'localhost', port: SERVER_PORT, path: '/api/ejs/prefetch',
+      method: 'POST', headers: { 'Content-Type': 'application/json',
+                                  'Content-Length': Buffer.byteLength(body) } },
+    res => { res.resume(); console.log(`[kente] EJS prefetch started (${res.statusCode})`); }
+  );
+  req.on('error', () => {}); // non-critical
+  req.end(body);
+}
+
+/**
+ * Verify BIOS presence and (where possible) auto-configure native emulators.
+ * Does NOT download BIOS files — it only uses what the user already provided.
+ */
+function ensureBiosSetup() {
+  // By default, do not attempt any network downloads at startup (offline-friendly).
+  // PS3 firmware download (PS3UPDAT.PUP) is only attempted when the user tries
+  // to launch a PS3 title and opts into setup.
+  const body = JSON.stringify({ allowDownload: false });
+  const req  = http.request(
+    { hostname: 'localhost', port: SERVER_PORT, path: '/api/bios/download',
+      method: 'POST', headers: { 'Content-Type': 'application/json',
+                                  'Content-Length': Buffer.byteLength(body) } },
+    res => { res.resume(); console.log(`[kente] BIOS check started (${res.statusCode})`); }
+  );
+  req.on('error', () => {}); // non-critical
+  req.end(body);
+}
+
 app.whenReady().then(async () => {
   startServer();
   try {
@@ -287,6 +441,10 @@ app.whenReady().then(async () => {
     // Ensure all emulator OS dependencies are installed.
     // Runs 4 s after window shows so paint isn't blocked.
     setTimeout(ensureEmulatorDeps, 4000);
+    // Seed EmulatorJS core cache in the background (enables offline play).
+    setTimeout(ensureEmulatorJSOfflinePack, 4500);
+    // Copy/configure provided BIOS files into native emulators where applicable.
+    setTimeout(ensureBiosSetup, 5500);
     setTimeout(initDiscord, 2000);   // after window is visible, connect Discord
   } catch (err) {
     console.error('[kente] Could not start server:', err.message);

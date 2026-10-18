@@ -3,14 +3,14 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <!-- Defence-in-depth CSP. Blocks inline <script> (no XSS via injected
-       markup) while keeping the permissive media/iframe surface that the
-       theater providers and EmulatorJS rely on. -->
+  <!-- Defence-in-depth CSP. Keeps scripts local while allowing the runtime
+       Blob-based scripts (EmulatorJS cores) and WebAssembly compilation that
+       browser emulation requires. -->
   <meta http-equiv="Content-Security-Policy"
-        content="default-src 'self';
-                 script-src 'self';
-                 style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;
-                 font-src 'self' https://fonts.gstatic.com data:;
+         content="default-src 'self';
+                 script-src 'self' blob: 'wasm-unsafe-eval';
+                 style-src 'self' 'unsafe-inline';
+                 font-src 'self' data:;
                  img-src 'self' data: blob: https: http:;
                  media-src 'self' blob: data: https: http:;
                  connect-src 'self' https: http: ws: wss:;
@@ -20,9 +20,8 @@
                  base-uri 'self';
                  form-action 'self';">
   <title>KENTE'S KORNER — BUILD 01</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Share+Tech+Mono&family=Rajdhani:wght@300;400;600;700&display=swap" rel="stylesheet">
+  <!-- Fonts are intentionally local/offline: use system fallbacks so the app
+       never depends on WAN TLS handshakes during boot. -->
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -45,7 +44,7 @@
       <div class="crt-overlay"></div>
       <div id="room-vignette"></div>
 
-      <!-- Interactive TV zones — populated by kente.js -->
+      <!-- Interactive TV zones — populated by js/room.js -->
       <div id="tv-zones"></div>
 
       <!-- Top HUD -->
@@ -400,6 +399,8 @@
               <div id="tpm-title"></div>
               <div id="tpm-btns">
                 <button type="button" class="tpm-btn" id="tpm-resume">▶&nbsp; RESUME</button>
+                <button type="button" class="tpm-btn" id="tpm-prev-ep" hidden>⏮&nbsp; PREVIOUS EPISODE</button>
+                <button type="button" class="tpm-btn" id="tpm-next-ep" hidden>⏭&nbsp; NEXT EPISODE</button>
                 <button type="button" class="tpm-btn" id="tpm-source" hidden>↻&nbsp; NEXT SOURCE</button>
                 <button type="button" class="tpm-btn" id="tpm-mini">⬓&nbsp; MINI-PLAYER</button>
                 <button type="button" class="tpm-btn" id="tpm-close">✕&nbsp; CLOSE PLAYER</button>
@@ -432,7 +433,7 @@
     <canvas id="matrix-exit-rain" hidden></canvas>
 
     <!-- ── Guide Overlay — USB Boot Guide + PS4 Console Mod ── -->
-    <!-- Populated dynamically by openGuide(type) in kente.js   -->
+    <!-- Populated dynamically by openGuide(type) in js/panels.js   -->
     <div id="guide-overlay" role="dialog" aria-modal="true" aria-label="Guide">
       <div id="guide-panel"></div>
     </div>
@@ -444,7 +445,35 @@
   <script defer src="vendor/hls.light.min.js"></script>
   <script defer src="library.js?v=6"></script>
   <script defer src="js/rom_db.js?v=1"></script>
-  <script defer src="kente.js?v=6"></script>
+  <!-- Application logic — order matters (shared global scope, see js/config.js). -->
+  <script defer src="js/config.js?v=8"></script>
+  <script defer src="js/ejs_patches.js?v=8"></script>
+  <script defer src="js/cloud.js?v=8"></script>
+  <script defer src="js/storage.js?v=8"></script>
+  <script defer src="js/download_manager.js?v=8"></script>
+  <script defer src="js/systems.js?v=8"></script>
+  <script defer src="js/fx.js?v=8"></script>
+  <script defer src="js/settings.js?v=8"></script>
+  <script defer src="js/native.js?v=8"></script>
+  <script defer src="js/rom_library.js?v=8"></script>
+  <script defer src="js/room.js?v=8"></script>
+  <script defer src="js/menus.js?v=8"></script>
+  <script defer src="js/theater.js?v=8"></script>
+  <script defer src="js/osk.js?v=8"></script>
+  <script defer src="js/theater_detail.js?v=8"></script>
+  <script defer src="js/settings_menu.js?v=8"></script>
+  <script defer src="js/sacrifice.js?v=8"></script>
+  <script defer src="js/game_detail.js?v=8"></script>
+  <script defer src="js/rom_tools.js?v=8"></script>
+  <script defer src="js/cloud_launch.js?v=8"></script>
+  <script defer src="js/emulatorjs.js?v=8"></script>
+  <script defer src="js/panels.js?v=8"></script>
+  <script defer src="js/flash.js?v=8"></script>
+  <script defer src="js/gamepad.js?v=8"></script>
+  <script defer src="js/camera.js?v=8"></script>
+  <script defer src="js/theater_player.js?v=8"></script>
+  <script defer src="js/theater_embed.js?v=8"></script>
+  <script defer src="js/events.js?v=8"></script>
+  <script defer src="js/main.js?v=8"></script>
 </body>
 </html>
-

@@ -4,9 +4,9 @@ Kente's Korner — Native API Server
 Serves the web shell and bridges to Batocera's emulation stack.
 stdlib only — no pip required.
 """
-__version__ = '1.1.0'
+__version__ = '2.0.0'
 
-import json, subprocess, os, threading, shutil, time, platform, hashlib, re, tempfile, sys
+import hashlib, json, os, platform, re, shutil, subprocess, sys, tempfile, threading, time, zipfile
 import urllib.request, urllib.parse, urllib.error
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -31,616 +31,164 @@ except Exception as _roms_err:
     roms = None
     print(f'[roms] provider module unavailable: {_roms_err}')
 
-PORT = 7777
+from kente_config import (
+    ARCHIVE_PACKS, BASE, BIOS_DIR, BIOS_FILES, COMMUNITY_CORES, CONF_FILE,
+    EJS_CDN_BASE, EJS_CORES_DIR, EJS_SEED_DIR, EJS_STABLE_DIR,
+    FLASH_CACHE_DIR, IS_APP, IS_BATOCERA, MAX_ROM_DL_SECS,
+    MAX_ROM_FILE_BYTES, MIME, NATIVE_EMU_LIN, NATIVE_EMU_WIN, PORT,
+    PROXY_ALLOWED_HOSTS, ROMS_DIR, SAVES_DIR, SYSTEM_FOLDER, WEB_DIR,
+    _CONF_LOCK, _DOWNLOAD_LOCK, _PROC_LOCK, _active_downloads, _rom_host_ok,
+    _rom_upstream_referer
+)
+from kente_emulators import (
+    EMULATOR_DEPS, _bios_dl_state, _bios_download_thread,
+    _check_emu_installed, _emu_install_state, _emulator_install_thread,
+    _rpcs3_firmware_installed, _winget_portable_glob
+)
+from kente_ejs import _ejs_get_extracted_core, _ejs_prefetch_state, _ejs_prefetch_thread
+from kente_mods import apply_mod, list_mods, mod_status, restore_mod
+from kente_network import _net_connect, _net_disconnect, _net_forget, _net_scan, _net_status
+from kente_boxart import _BOXART_DIR, _boxart_fetch_online
 
-# ── Deployment mode detection ───────────────────────────────────────────────
-# IS_BATOCERA: running on Batocera Linux (or KENTE_FORCE_NATIVE=1 dev override)
-# IS_APP:      running as a packaged Electron desktop app (KENTE_APP_MODE=electron)
-# Default:     browser/dev mode — web files relative to script, no native paths
-IS_BATOCERA = platform.system() == 'Linux' or os.getenv('KENTE_FORCE_NATIVE') == '1'
-IS_APP      = os.getenv('KENTE_APP_MODE') == 'electron'
+# ── Archive.org cue+bin → zip bundling ──────────────────────────────────────
+# Multi-track CD dumps on Archive.org are stored as separate files: a small
+# .cue index plus one or more .bin data/audio tracks.  Emulators (and EJS's
+# pcsx_rearmed core) need ALL of them to play the disc; downloading the .cue
+# alone produces a 1-2 KB text file and an instant black screen.
+#
+# When the proxy is asked to fetch a .cue from archive.org we transparently:
+#   1. Parse the archive item identifier from the URL.
+#   2. List sibling files in the item.
+#   3. Read the .cue text, extract its `FILE "track.bin" BINARY` references.
+#   4. Stream the .cue + all referenced tracks into a single .zip (ZIP_STORED,
+#      no compression — disc images are already compressed by Redump).
+#   5. Stream the zip body back to the client and (optionally) save to disk.
+#
+# Memory bound: SpooledTemporaryFile rolls over to disk past `spool_max`,
+# so a 700 MB PSX dump never lives in RAM in full.
 
-if IS_APP:
-    # Electron passes KENTE_DATA_DIR = %APPDATA%/KenteCorner (or equivalent).
-    # ROMs, BIOS files, and saves all live there — not in the install directory.
-    _data    = Path(os.getenv('KENTE_DATA_DIR', Path.home() / 'KenteCorner'))
-    BASE     = _data
-    BIOS_DIR = _data / 'bios'
-    ROMS_DIR = _data / 'roms'
-    # Web files live next to the script (inside the packaged asar) or at the
-    # workspace root in dev mode — same as the default/non-Batocera layout.
-    WEB_DIR  = Path(__file__).parent.parent
-elif IS_BATOCERA:
-    BASE     = Path('/userdata')
-    BIOS_DIR = BASE / 'bios'
-    ROMS_DIR = BASE / 'roms'
-    WEB_DIR  = Path(__file__).parent   # server lives in /userdata/kente/
-else:
-    BASE     = Path(__file__).parent.parent
-    BIOS_DIR = BASE / 'bios'
-    ROMS_DIR = BASE / 'roms'
-    WEB_DIR  = BASE
+_CUE_FILE_RE = re.compile(r'^\s*FILE\s+"([^"]+)"', re.I | re.M)
 
-# Ensure app-mode data directories exist on first launch
-if IS_APP:
-    ROMS_DIR.mkdir(parents=True, exist_ok=True)
-    BIOS_DIR.mkdir(parents=True, exist_ok=True)
-    (BASE / 'saves').mkdir(parents=True, exist_ok=True)
+def _archive_cue_components(cue_url):
+    """If `cue_url` is an archive.org .cue download URL, return
+    (identifier, cue_name, [data_track_names]).  Otherwise return None.
 
-# ── EmulatorJS CDN proxy ────────────────────────────────────────────────────
-# Community cores not on the official CDN are served from a local cache dir.
-# /api/ejs/<subpath> proxies everything else to cdn.emulatorjs.org/stable/data/
-EJS_CDN_BASE  = 'https://cdn.emulatorjs.org/stable/data/'
-EJS_CORES_DIR = WEB_DIR / 'ejs-cores'   # local cache for community-built cores
+    A second metadata round-trip lists the item to discover sibling tracks;
+    cached by _archive_item_files() (TTL 900s) so repeat downloads are free.
+    """
+    if not cue_url.lower().endswith('.cue'): return None
+    parsed = urllib.parse.urlparse(cue_url)
+    host = (parsed.hostname or '').lower()
+    if not (host == 'archive.org' or host.endswith('.archive.org')):
+        return None
+    m = re.match(r'^/download/([^/]+)/(.+)$', parsed.path)
+    if not m: return None
+    ident = urllib.parse.unquote(m.group(1))
+    cue_name = urllib.parse.unquote(m.group(2))
+    if '/' in cue_name:  # nested file inside item; bundling not supported
+        return None
+    # Inline metadata fetch (no cache shared with rom_providers module — keep
+    # this stdlib-only path self-contained).
+    meta_url = f'https://archive.org/metadata/{urllib.parse.quote(ident)}'
+    try:
+        with urllib.request.urlopen(meta_url, timeout=12) as r:
+            data = json.loads(r.read().decode('utf-8', 'replace'))
+    except Exception as e:
+        print(f'[cue-bundle] metadata fetch failed for {ident}: {e}')
+        return None
+    sibling_names = [(f.get('name') or '') for f in (data.get('files') or [])]
+    sibling_names = [n for n in sibling_names if n and '/' not in n]
+    if cue_name not in sibling_names:
+        return None
+    # Also fetch the cue body so we can resolve relative FILE references.
+    cue_body_url = (f'https://archive.org/download/{urllib.parse.quote(ident)}/'
+                    f'{urllib.parse.quote(cue_name)}')
+    try:
+        with urllib.request.urlopen(cue_body_url, timeout=12) as r:
+            cue_text = r.read().decode('utf-8', 'replace')
+    except Exception as e:
+        print(f'[cue-bundle] cue read failed for {ident}/{cue_name}: {e}')
+        return None
+    refs = [m.strip() for m in _CUE_FILE_RE.findall(cue_text) if m.strip()]
+    tracks = []
+    sib_low = {s.lower(): s for s in sibling_names}
+    for r in refs:
+        rl = Path(r).name.lower()
+        if rl in sib_low:
+            tracks.append(sib_low[rl])
+    # Some Redump cues reference uppercase names; fall back to any sibling
+    # .bin/.img whose stem matches the .cue stem.
+    if not tracks:
+        stem = Path(cue_name).stem.lower()
+        for s in sibling_names:
+            sl = s.lower()
+            if sl.endswith(('.bin', '.img')) and Path(s).stem.lower().startswith(stem):
+                tracks.append(s)
+    if not tracks:
+        print(f'[cue-bundle] no data tracks found alongside {ident}/{cue_name}')
+        return None
+    return ident, cue_name, tracks, cue_text
 
-# Flycast (Dreamcast) — built by nasomers/flycast-wasm (github.com/nasomers/flycast-wasm)
-# The stable CDN doesn't host this core.  We serve it from a local cache and
-# download it on first request.  Both the "wasm" and "legacy-wasm" names are
-# mapped to the same WebGL2 file so EJS works regardless of its requiresWebGL2
-# flag (Flycast is not in EJS's built-in list, so EJS requests the legacy name).
-COMMUNITY_CORES = {
-    'flycast-wasm.data':        'https://github.com/nasomers/flycast-wasm/releases/download/v1.0.0/flycast-wasm.data',
-    'flycast-legacy-wasm.data': 'https://github.com/nasomers/flycast-wasm/releases/download/v1.0.0/flycast-wasm.data',
-}
 
-# Kente systemId → Batocera ROM folder name
-# Values must match Batocera's /userdata/roms/<folder>/ directory names exactly.
-SYSTEM_FOLDER = {
-    # Kente systemId  →  Batocera ROM folder / emulatorlauncher system name
-    # All values verified against https://wiki.batocera.org/systems (2025)
-    # Tier 1
-    'nes':        'nes',
-    'gameboy':    'gb',
-    'mastersys':  'mastersystem',   # Batocera: mastersystem  (NOT mastersys)
-    'atari2600':  'atari2600',
-    'atari7800':  'atari7800',
-    'gamegear':   'gamegear',
-    # Tier 2
-    'snes':       'snes',
-    'genesis':    'megadrive',
-    'gbc':        'gbc',
-    'gba':        'gba',
-    'turbografx': 'pcengine',
-    'neogeo':     'neogeo',
-    'segacd':     'megacd',         # Batocera: megacd        (NOT segacd)
-    'sega32x':    'sega32x',
-    # Tier 3
-    'n64':        'n64',
-    'ps1':        'psx',
-    'saturn':     'saturn',
-    'dreamcast':  'dreamcast',
-    'nds':        'nds',
-    'psp':        'psp',
-    # Tier 4
-    'ps2':        'ps2',
-    'gamecube':   'gamecube',
-    'wii':        'wii',
-    'xbox':       'xbox',
-    # Tier 5
-    'wiiu':       'wiiu',
-    'xbox360':    'xbox360',
-    'ps3':        'ps3',
-    'switch':     'switch',
-}
+def _build_cue_bundle_zip(ident, cue_name, cue_text, track_names, spool_max=64*1024*1024):
+    """Return a seekable SpooledTemporaryFile containing a ZIP of cue + tracks.
 
-# ── Archive.org Pack Collections ─────────────────────────────────────────────
-# These Archive.org identifiers host individual ROM files (not monolithic archives).
-# Used by /api/pack/search as a fallback when the general subject search misses.
-# Only systems with a verified individual-file pack are listed here.
-ARCHIVE_PACKS = {
-    'nes':  'pack-roms-nintendo-entertainment-system',  # 953 individual .7z files
-    'snes': 'chrono-trigger-2-crimson-echoes-usa',      # 961 individual .sfc files
-    # PSP: individual game items exist on Archive.org (subject:PSP, mediatype:data)
-    # and are found by the general search; no verified individual-file pack available.
-}
+    Caller is responsible for closing the file once streaming is complete.
+    """
+    spool = tempfile.SpooledTemporaryFile(max_size=spool_max)
+    with zipfile.ZipFile(spool, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+        zf.writestr(cue_name, cue_text)
+        for tname in track_names:
+            track_url = (f'https://archive.org/download/{urllib.parse.quote(ident)}/'
+                         f'{urllib.parse.quote(tname)}')
+            req = urllib.request.Request(track_url, headers={
+                'User-Agent': 'Mozilla/5.0 (compatible; KenteKorner/1.0)',
+            })
+            with urllib.request.urlopen(req, timeout=300) as resp, \
+                 zf.open(tname, 'w', force_zip64=True) as zf_out:
+                while True:
+                    chunk = resp.read(262144)
+                    if not chunk: break
+                    zf_out.write(chunk)
+    spool.seek(0)
+    return spool
 
-# System → ordered candidate emulator paths (Windows, env-var strings expanded at call time)
-NATIVE_EMU_WIN = {
-    'ps2':       [r'%ProgramFiles%\PCSX2\pcsx2-qt.exe',
-                  r'%ProgramFiles%\PCSX2\PCSX2.exe',
-                  r'%ProgramFiles(x86)%\PCSX2\PCSX2.exe',
-                  r'%LOCALAPPDATA%\Programs\PCSX2\pcsx2-qt.exe'],
-    'dreamcast': [r'%ProgramFiles%\Flycast\flycast.exe',
-                  r'%LOCALAPPDATA%\Programs\Flycast\flycast.exe',
-                  r'%ProgramFiles%\Redream\redream.exe',
-                  r'%LOCALAPPDATA%\Programs\Redream\redream.exe'],
-    'gamecube':  [r'%ProgramFiles%\Dolphin\Dolphin.exe',
-                  r'%LOCALAPPDATA%\Programs\Dolphin\Dolphin.exe'],
-    'wii':       [r'%ProgramFiles%\Dolphin\Dolphin.exe',
-                  r'%LOCALAPPDATA%\Programs\Dolphin\Dolphin.exe'],
-    'wiiu':      [r'%ProgramFiles%\Cemu\Cemu.exe',
-                  r'%LOCALAPPDATA%\Programs\Cemu\Cemu.exe',
-                  r'%LOCALAPPDATA%\Microsoft\WinGet\Packages\Cemu.Cemu_Microsoft.Winget.Source_8wekyb3d8bbwe\Cemu.exe'],
-    'switch':    [r'%APPDATA%\Ryujinx\publish\Ryujinx.exe',
-                  r'%ProgramFiles%\Ryujinx\publish\Ryujinx.exe',
-                  r'%LOCALAPPDATA%\Programs\Ryujinx\Ryujinx.exe'],
-    'xbox':      [r'%ProgramFiles%\xemu\xemu.exe',
-                  r'%LOCALAPPDATA%\Programs\xemu\xemu.exe'],
-    'xbox360':   [r'%ProgramFiles%\Xenia\xenia.exe',
-                  r'%LOCALAPPDATA%\Programs\Xenia\xenia.exe'],
-    'ps3':       [r'%ProgramFiles%\RPCS3\rpcs3.exe',
-                  r'%LOCALAPPDATA%\Programs\RPCS3\rpcs3.exe'],
-}
-
-# In Electron app mode, prepend the bundled Dolphin portable path so it is
-# found before any system-installed Dolphin.  KENTE_DOLPHIN_PATH is set by
-# electron/main.js and points to resources/dolphin/Dolphin.exe inside the app.
-_bundled_dolphin = os.getenv('KENTE_DOLPHIN_PATH', '')
-if _bundled_dolphin:
-    for _sid in ('gamecube', 'wii'):
-        NATIVE_EMU_WIN.setdefault(_sid, []).insert(0, _bundled_dolphin)
-
-# System → ordered candidate emulator commands (Linux — resolved via shutil.which)
-NATIVE_EMU_LIN = {
-    'ps2':       ['pcsx2-qt', 'pcsx2'],
-    'dreamcast': ['flycast', 'redream'],
-    'gamecube':  ['dolphin-emu', 'dolphin'],
-    'wii':       ['dolphin-emu', 'dolphin'],
-    'switch':    ['ryujinx'],
-    'ps3':       ['rpcs3'],
-    'xbox':      ['xemu'],
-}
-
-# Required / optional BIOS filenames per system
-BIOS_FILES = {
-    'gba':'gba_bios.bin', 'gameboy':'gb_bios.bin', 'gbc':'gbc_bios.bin',
-    'nds':'bios7.bin',
-    'ps1':'scph1001.bin', 'ps2':'scph39001.bin', 'saturn':'saturn_bios.bin',
-    'dreamcast':'dc_boot.bin', 'dreamcast_flash':'dc_flash.bin',
-    'neogeo':'neogeo.zip', 'mastersys':'bios_U.sms',
-    'atari7800':'7800 BIOS (U).rom',
-}
-
-MIME = {
-    # Text / scripts
-    '.html':'text/html', '.js':'application/javascript',
-    '.css':'text/css',   '.json':'application/json',
-    '.txt':'text/plain', '.xml':'application/xml',
-    # Images
-    '.png':'image/png',  '.jpg':'image/jpeg', '.jpeg':'image/jpeg',
-    '.gif':'image/gif',  '.webp':'image/webp', '.avif':'image/avif',
-    '.svg':'image/svg+xml', '.ico':'image/x-icon',
-    # Fonts
-    '.woff':'font/woff', '.woff2':'font/woff2',
-    '.ttf':'font/ttf',   '.otf':'font/otf',
-    # Audio / video
-    '.mp3':'audio/mpeg', '.ogg':'audio/ogg', '.wav':'audio/wav',
-    '.mp4':'video/mp4',  '.webm':'video/webm',
-    # Flash / Ruffle / EmulatorJS
-    '.swf':'application/x-shockwave-flash',
-    '.wasm':'application/wasm',
-}
-
-SAVES_DIR       = BASE / 'saves'
-CONF_FILE       = BASE / 'system' / 'batocera.conf'
-
-# ── Mod system ──────────────────────────────────────────────────────────────
-# Mods live in workspace/mods/<gameId>/<modName>/*.ssf
-# _backup/ inside each game folder stores the originals before a mod is applied.
-MODS_DIR         = Path(__file__).parent.parent / 'mods'
-
-# SSF2 data directories — contains the DAT*.ssf files that mods replace.
-SSF2_WIN_DATA    = Path('C:/Program Files (x86)/Super Smash Flash 2 Beta')
-SSF2_LIN_DATA    = Path.home() / 'ssf2' / 'data' / 'data'  # ~/ssf2/data/data on Linux
-
-# Lock protecting read-modify-write access to batocera.conf from concurrent threads
-_CONF_LOCK = threading.Lock()
-# Lock protecting active_proc from concurrent launch/status races
-_PROC_LOCK = threading.Lock()
-# Guards _active_downloads so concurrent requests for the same file are serialised
-_DOWNLOAD_LOCK  = threading.Lock()
-_active_downloads: set = set()          # set of dest_file paths currently downloading
-FLASH_CACHE_DIR = BASE / 'games' / 'flash' / 'ssf2-cache'
-# Maximum wall-clock seconds for a single ROM download.
-# 4 hours covers Switch/PS3/Wii U titles (up to 50 GB) at ~3 MB/s.
-MAX_ROM_DL_SECS  = 14400  # 4 hours
-# Hard per-file size cap: reject any response that exceeds this to prevent a
-# malicious or misconfigured URL from filling the disk with garbage data.
-MAX_ROM_FILE_BYTES = 100 * 1024 ** 3  # 100 GB
-
-# Hosts allowed to be fetched through the flash proxy
-PROXY_ALLOWED_HOSTS = {
-    'www.supersmashflash.com', 'supersmashflash.com',
-    'www.mcleodgaming.com',    'mcleodgaming.com',
-}
 
 active_proc = None
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def bios_status():
-    return {sid: (BIOS_DIR / fname).exists() for sid, fname in BIOS_FILES.items()}
-
-# ── BIOS downloader ───────────────────────────────────────────────────────────
-# Strategy:
-#   1. Files with a DIRECT URL → downloaded individually (fast, no big zip needed).
-#   2. Remaining missing files → downloaded from the 246 MB BIOS pack zip on
-#      archive.org; only files not already on disk are extracted.
-#   3. PS2 BIOS files are also copied into PCSX2's own bios folder so the
-#      emulator can find them, and PCSX2.ini is updated with the correct filename.
-
-BIOS_PACK_URL = 'https://archive.org/download/bios-v-30_202103/BIOS%20-V-%2030.zip'
-
-# archive.org serves individual files from within zips at this URL pattern:
-#   /download/<id>/<zipname>/<internal-path>
-_IA_BASE = 'https://archive.org/download/bios-v-30_202103/BIOS%20-V-%2030.zip/BIOS%20-V-%2030%2F'
-
-# Files we can fetch individually (small, or otherwise separately available)
-BIOS_DIRECT_URLS = {
-    'scph39001.bin': _IA_BASE + 'scph39001.bin',   # PS2 NTSC-U  4 MB
-    'scph39001.MEC': _IA_BASE + 'scph39001.MEC',   # PS2 MEC companion  4 B
-}
-
-# Files in the pack zip that require a full-zip download (path inside zip)
-BIOS_PACK_ENTRIES = {
-    'gba_bios.bin':    'BIOS -V- 30/gba_bios.bin',
-    'gb_bios.bin':     'BIOS -V- 30/gb_bios.bin',
-    'gbc_bios.bin':    'BIOS -V- 30/gbc_bios.bin',
-    'bios7.bin':       'BIOS -V- 30/bios7.bin',
-    'scph1001.bin':    'BIOS -V- 30/scph1001.bin',
-    'saturn_bios.bin': 'BIOS -V- 30/saturn_bios.bin',
-    'dc_boot.bin':     'BIOS -V- 30/dc_boot.bin',
-    'dc_flash.bin':    'BIOS -V- 30/dc_flash.bin',
-    'neogeo.zip':      'BIOS -V- 30/neogeo.zip',
-    # bios_U.sms / 7800 BIOS (U).rom not in pack — optional, skip.
-}
-
-# Shared state — written by background thread, read by status endpoint
-_bios_dl_state = {
-    'running': False,
-    'done':    False,
-    'error':   None,
-    'phase':   '',
-    'downloaded_mb': 0,
-    'total_mb':      0,
-    'results':       {},
-}
-
-def _bios_configure_pcsx2(bios_dir: Path):
-    """Copy PS2 BIOS files into PCSX2's bios folder and update PCSX2.ini."""
-    import os as _os
-    user = Path(_os.environ.get('USERPROFILE', _os.path.expanduser('~')))
-    pcsx2_bios = user / 'Documents' / 'PCSX2' / 'bios'
-    pcsx2_ini  = user / 'Documents' / 'PCSX2' / 'inis' / 'PCSX2.ini'
-
-    ps2_files = ['scph39001.bin', 'scph39001.MEC']
-    pcsx2_bios.mkdir(parents=True, exist_ok=True)
-    copied = []
-    for fname in ps2_files:
-        src = bios_dir / fname
-        dst = pcsx2_bios / fname
-        if src.exists() and not dst.exists():
-            import shutil as _sh
-            _sh.copy2(str(src), str(dst))
-            copied.append(fname)
-            print(f'[bios] copied {fname} -> {dst}')
-
-    # Update PCSX2.ini: set  BIOS = scph39001.bin  (only under [Filenames] section)
-    # We do a line-by-line walk so we never accidentally touch the [Folders] Bios key.
-    if pcsx2_ini.exists():
-        try:
-            lines = pcsx2_ini.read_text(encoding='utf-8', errors='replace').splitlines(keepends=True)
-            in_filenames = False
-            changed = False
-            for i, line in enumerate(lines):
-                stripped = line.strip()
-                if stripped.startswith('['):
-                    in_filenames = stripped.lower() == '[filenames]'
-                elif in_filenames and stripped.upper().startswith('BIOS') and '=' in stripped:
-                    key, _, _ = stripped.partition('=')
-                    if key.strip().upper() == 'BIOS':
-                        eol = '\r\n' if line.endswith('\r\n') else '\n'
-                        lines[i] = f'BIOS = scph39001.bin{eol}'
-                        changed = True
-                        break
-            if changed:
-                pcsx2_ini.write_text(''.join(lines), encoding='utf-8')
-                print('[bios] PCSX2.ini updated: BIOS = scph39001.bin')
-        except Exception as ex:
-            print(f'[bios] PCSX2.ini update failed: {ex}')
-    return copied
-
-def _bios_download_thread():
-    import tempfile, zipfile as _zf, urllib.request as _ur
-    global _bios_dl_state
-    _bios_dl_state.update({'running': True, 'done': False, 'error': None,
-                           'phase': 'downloading', 'results': {},
-                           'downloaded_mb': 0, 'total_mb': 0})
-    BIOS_DIR.mkdir(parents=True, exist_ok=True)
-    headers = {'User-Agent': 'Mozilla/5.0 KenteKorner/1.0'}
-    results = {}
-    tmp_path = None
-
-    try:
-        # ── Phase 1: direct per-file downloads ────────────────────────────────
-        for fname, url in BIOS_DIRECT_URLS.items():
-            dest = BIOS_DIR / fname
-            if dest.exists():
-                results[fname] = 'already_exists'
-                continue
-            _bios_dl_state['phase'] = f'downloading {fname}'
+    # PS2 BIOS dumps vary by region/model filename; accept any plausible .bin.
+    out = {}
+    for sid, fname in BIOS_FILES.items():
+        if sid == 'ps2':
+            ok = False
             try:
-                req = _ur.Request(url, headers=headers)
-                with _ur.urlopen(req, timeout=120) as resp:
-                    dest.write_bytes(resp.read())
-                results[fname] = 'ok'
-                print(f'[bios] downloaded {fname} ({dest.stat().st_size//1024} KB)')
-            except Exception as ex:
-                results[fname] = f'direct_error: {ex}'
-                print(f'[bios] direct download failed for {fname}: {ex}')
-
-        # ── Phase 2: pack download for anything still missing ─────────────────
-        pack_needed = [fn for fn, zp in BIOS_PACK_ENTRIES.items()
-                       if not (BIOS_DIR / fn).exists()]
-        if pack_needed:
-            _bios_dl_state['phase'] = 'downloading pack'
-            req = _ur.Request(BIOS_PACK_URL, headers=headers)
-            with _ur.urlopen(req, timeout=300) as resp:
-                total = int(resp.headers.get('Content-Length', 0))
-                _bios_dl_state['total_mb'] = round(total / 1e6, 1)
-                with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as tmp:
-                    tmp_path = tmp.name
-                    downloaded = 0
-                    chunk = 1 << 17
-                    while True:
-                        buf = resp.read(chunk)
-                        if not buf:
-                            break
-                        tmp.write(buf)
-                        downloaded += len(buf)
-                        _bios_dl_state['downloaded_mb'] = round(downloaded / 1e6, 1)
-
-            _bios_dl_state['phase'] = 'extracting'
-            with _zf.ZipFile(tmp_path, 'r') as zf:
-                for dest_name, zip_path in BIOS_PACK_ENTRIES.items():
-                    dest = BIOS_DIR / dest_name
-                    if dest.exists():
-                        results[dest_name] = 'already_exists'
+                for p in BIOS_DIR.iterdir():
+                    if not p.is_file() or p.suffix.lower() != '.bin':
                         continue
                     try:
-                        data = zf.read(zip_path)
-                        dest.write_bytes(data)
-                        results[dest_name] = 'ok'
-                        print(f'[bios] extracted {dest_name} ({len(data)//1024} KB)')
-                    except KeyError:
-                        results[dest_name] = f'not_found_in_zip'
-                    except Exception as ex:
-                        results[dest_name] = f'error: {ex}'
-        else:
-            for fn in BIOS_PACK_ENTRIES:
-                if fn not in results:
-                    results[fn] = 'already_exists'
-
-        # ── Phase 3: configure PCSX2 with its BIOS ────────────────────────────
-        _bios_dl_state['phase'] = 'configuring pcsx2'
-        copied = _bios_configure_pcsx2(BIOS_DIR)
-        if copied:
-            results['pcsx2_setup'] = f'copied {copied}, ini updated'
-        else:
-            results['pcsx2_setup'] = 'already configured'
-
-        _bios_dl_state.update({'running': False, 'done': True, 'phase': 'done',
-                                'results': results})
-        print(f'[bios] all done: {results}')
-
-    except Exception as ex:
-        _bios_dl_state.update({'running': False, 'done': False,
-                                'error': str(ex), 'phase': 'error'})
-        print(f'[bios] download failed: {ex}')
-    finally:
-        if tmp_path:
-            try:
-                import os as _os; _os.unlink(tmp_path)
+                        if p.stat().st_size >= 1_000_000:  # PS2 BIOS bins are typically >1MB
+                            ok = True
+                            break
+                    except OSError:
+                        continue
             except Exception:
-                pass
-
-# ── Emulator dependency installer ─────────────────────────────────────────────
-# Emulators are treated as OS-level dependencies.  Missing ones are installed
-# automatically via WinGet (preferred) or direct GitHub release download.
-# On Linux (KenteOS bootable) AppImages are downloaded to /opt/kente/emulators/.
-
-_APPDATA   = os.environ.get('APPDATA',      os.path.expanduser('~'))
-_LOCALAPP  = os.environ.get('LOCALAPPDATA', os.path.expanduser('~'))
-_PROGFILES = os.environ.get('ProgramFiles', r'C:\Program Files')
-
-EMULATOR_DEPS = {
-    'flycast': {
-        'name':       'Flycast (Dreamcast)',
-        'systems':    ['dreamcast'],
-        'winget_id':  None,   # not in WinGet registry
-        'win_exe':    Path(_LOCALAPP) / 'Programs' / 'Flycast' / 'flycast.exe',
-        'win_dest':   Path(_LOCALAPP) / 'Programs' / 'Flycast',
-        'win_dl':     'https://github.com/flyinghead/flycast/releases/download/v2.6/flycast-win64-2.6.zip',
-        'win_dl_exe': 'flycast.exe',
-        'lin_appimg': 'https://github.com/flyinghead/flycast/releases/download/v2.6/flycast-linux-x86_64',
-    },
-    'rpcs3': {
-        'name':       'RPCS3 (PlayStation 3)',
-        'systems':    ['ps3'],
-        'winget_id':  'RPCS3.RPCS3',
-        'win_exe':    Path(_LOCALAPP) / 'Programs' / 'RPCS3' / 'rpcs3.exe',
-        'win_dest':   Path(_LOCALAPP) / 'Programs' / 'RPCS3',
-        'win_dl':     None,   # WinGet preferred; .7z needs external extractor
-        'lin_appimg': 'https://github.com/RPCS3/rpcs3-binaries-linux/releases/latest/download/rpcs3.AppImage',
-    },
-    'cemu': {
-        'name':       'Cemu (Wii U)',
-        'systems':    ['wiiu'],
-        'winget_id':  'Cemu.Cemu',
-        'win_exe':    Path(_LOCALAPP) / 'Programs' / 'Cemu' / 'Cemu.exe',
-        'win_dest':   Path(_LOCALAPP) / 'Programs' / 'Cemu',
-        'win_dl':     None,   # WinGet preferred
-        'lin_appimg': 'https://github.com/cemu-project/Cemu/releases/latest/download/Cemu-2.0-x86_64.AppImage',
-    },
-}
-
-_emu_install_state = {
-    'running': False,
-    'done':    False,
-    'error':   None,
-    'current': '',
-    'results': {},
-}
-
-def _winget_portable_glob(pkg_id, exe_name):
-    """Search %LOCALAPPDATA%\\Microsoft\\WinGet\\Packages for a WinGet portable install.
-
-    WinGet portable packages land at:
-      %LOCALAPPDATA%\\Microsoft\\WinGet\\Packages\\{PackageId}_{Publisher}_{hash}\\[subdir]\\{exe}
-    We match any directory whose name starts with the PackageId (e.g. 'Cemu.Cemu').
-    """
-    winget_base = Path(os.environ.get('LOCALAPPDATA', '')) / 'Microsoft' / 'WinGet' / 'Packages'
-    if not winget_base.exists():
-        return None
-    try:
-        pkg_dirs = list(winget_base.iterdir())
-    except PermissionError:
-        return None
-    for pkg_dir in pkg_dirs:
-        if not pkg_dir.name.startswith(pkg_id):
-            continue
-        # Check directly inside the package folder
-        exe = pkg_dir / exe_name
-        if exe.exists():
-            return str(exe)
-        # Check one level deep (some packages unzip into a versioned subfolder)
-        try:
-            for sub in pkg_dir.iterdir():
-                if sub.is_dir():
-                    exe2 = sub / exe_name
-                    if exe2.exists():
-                        return str(exe2)
-        except PermissionError:
-            continue
-    return None
-
-def _check_emu_installed(key):
-    """Return (installed: bool, path: str|None) for an emulator key."""
-    dep    = EMULATOR_DEPS[key]
-    is_win = platform.system() == 'Windows'
-    if is_win:
-        # 1. Check declared win_exe path
-        p = dep.get('win_exe')
-        if p and p.exists():
-            return True, str(p)
-        # 2. Check NATIVE_EMU_WIN paths for each system this emulator covers
-        for sid in dep.get('systems', []):
-            for candidate in NATIVE_EMU_WIN.get(sid, []):
-                ep = Path(os.path.expandvars(candidate))
-                if ep.exists():
-                    return True, str(ep)
-        # 3. Glob WinGet portable packages directory
-        wg_id  = dep.get('winget_id', '')
-        if wg_id:
-            exe_name = dep['win_exe'].name if dep.get('win_exe') else f'{key}.exe'
-            found = _winget_portable_glob(wg_id, exe_name)
-            if found:
-                return True, found
-    else:
-        appimg = Path('/opt/kente/emulators') / f'{key}.AppImage'
-        if appimg.exists():
-            return True, str(appimg)
-        found = shutil.which(key) or shutil.which(key.upper())
-        if found:
-            return True, found
-    return False, None
-
-def _run_winget(pkg_id):
-    """Install via winget silently. Returns (ok: bool, output: str)."""
-    try:
-        r = subprocess.run(
-            ['winget', 'install', '--id', pkg_id, '--silent',
-             '--accept-package-agreements', '--accept-source-agreements', '--force'],
-            capture_output=True, text=True, timeout=300,
-        )
-        return r.returncode == 0, (r.stdout + r.stderr)[:500]
-    except FileNotFoundError:
-        return False, 'winget not available'
-    except Exception as ex:
-        return False, str(ex)
-
-def _emulator_install_thread():
-    import zipfile as _zf, urllib.request as _ur, io as _io
-    global _emu_install_state
-    _emu_install_state.update({'running': True, 'done': False,
-                               'error': None, 'current': '', 'results': {}})
-    results  = {}
-    is_win   = platform.system() == 'Windows'
-    headers  = {'User-Agent': 'Mozilla/5.0 KenteOS/1.0'}
-
-    for key, dep in EMULATOR_DEPS.items():
-        installed, path = _check_emu_installed(key)
-        if installed:
-            results[key] = {'status': 'already_installed', 'path': path}
-            continue
-
-        _emu_install_state['current'] = dep['name']
-        print(f'[emu] Installing {dep["name"]}...')
-
-        if is_win:
-            # 1. Try WinGet
-            wg = dep.get('winget_id')
-            if wg:
-                ok, out = _run_winget(wg)
-                if ok:
-                    _, p2 = _check_emu_installed(key)
-                    results[key] = {'status': 'installed_winget', 'path': p2}
-                    print(f'[emu] {dep["name"]} installed via WinGet')
-                    continue
-                print(f'[emu] WinGet failed for {key}: {out}')
-
-            # 2. Direct zip download
-            dl = dep.get('win_dl')
-            if dl:
-                try:
-                    dest_dir = dep['win_dest']
-                    dest_dir.mkdir(parents=True, exist_ok=True)
-                    req = _ur.Request(dl, headers=headers)
-                    with _ur.urlopen(req, timeout=120) as resp:
-                        raw = resp.read()
-                    with _zf.ZipFile(_io.BytesIO(raw)) as zf:
-                        zf.extractall(str(dest_dir))
-                    # Flatten one nested folder if present (some zips wrap in a subdir)
-                    import shutil as _sh2
-                    for sub in list(dest_dir.iterdir()):
-                        if sub.is_dir():
-                            for f in sub.iterdir():
-                                dst = dest_dir / f.name
-                                # shutil.move handles FileExistsError on Windows correctly
-                                _sh2.move(str(f), str(dst))
-                            try: sub.rmdir()
-                            except OSError: pass
-                    _, p3 = _check_emu_installed(key)
-                    results[key] = {'status': 'installed_download', 'path': p3}
-                    print(f'[emu] {dep["name"]} installed via direct download')
-                except Exception as ex:
-                    results[key] = {'status': 'error', 'error': str(ex)}
-                    print(f'[emu] {dep["name"]} install failed: {ex}')
-            else:
-                results[key] = {'status': 'manual_required',
-                                'reason': 'No WinGet entry and no zip URL — install manually'}
+                ok = False
+            out[sid] = ok
         else:
-            # Linux: download AppImage
-            url = dep.get('lin_appimg')
-            if url:
-                try:
-                    dest = Path('/opt/kente/emulators') / f'{key}.AppImage'
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    req = _ur.Request(url, headers=headers)
-                    with _ur.urlopen(req, timeout=300) as resp:
-                        dest.write_bytes(resp.read())
-                    dest.chmod(0o755)
-                    results[key] = {'status': 'installed_appimage', 'path': str(dest)}
-                    print(f'[emu] {dep["name"]} AppImage installed -> {dest}')
-                except Exception as ex:
-                    results[key] = {'status': 'error', 'error': str(ex)}
-                    print(f'[emu] {dep["name"]} AppImage install failed: {ex}')
-            else:
-                results[key] = {'status': 'unavailable'}
+            out[sid] = (BIOS_DIR / fname).exists()
+    return out
 
-    _emu_install_state.update({'running': False, 'done': True,
-                               'current': '', 'results': results})
-    print(f'[emu] install complete: {results}')
+def _norm_rom_key(s):
+    """Strip separators / punctuation so 'Bratz: Adult!' and 'bratz_adult'
+    collapse to the same comparable key for find_rom matching."""
+    return (s or '').lower() \
+        .replace(' ', '').replace('_', '').replace('-', '') \
+        .replace(':', '').replace("'", '').replace('&', '') \
+        .replace('(', '').replace(')', '').replace('[', '').replace(']', '') \
+        .replace('.', '').replace(',', '').replace('!', '')
 
 def find_rom(system_id, title):
     """Fuzzy-match a ROM file for system_id by title.
@@ -648,9 +196,12 @@ def find_rom(system_id, title):
     Searches two candidate directories:
       1. ROMS_DIR / SYSTEM_FOLDER[system_id]  — Batocera canonical name (e.g. 'psx')
       2. ROMS_DIR / system_id                 — local desktop layout (e.g. 'ps1')
-    Returns the full path string of the first match, or None.
+    Returns the full path string of the first match, or None. Skips partial
+    downloads (.tmp/.part) and metadata sidecars (.txt/.nfo/.json) so a stray
+    readme never wins over the actual ROM/ISO.
     """
-    needle = title.lower().replace(' ', '').replace(':', '').replace("'", '').replace('&', '')
+    needle = _norm_rom_key(title)
+    _META_EXT = {'.txt', '.nfo', '.md', '.json', '.xml', '.url', '.sfv', '.diz'}
 
     # Build search dirs without duplicates
     batocera_folder = SYSTEM_FOLDER.get(system_id)
@@ -665,10 +216,13 @@ def find_rom(system_id, title):
         if not rom_dir.exists():
             continue
         for f in sorted(rom_dir.iterdir()):
-            if not f.is_file() or f.suffix.lower() in ('.tmp', '.part'):
+            if not f.is_file():
                 continue
-            stem = f.stem.lower().replace(' ', '').replace('_', '').replace('-', '').replace("'", '').replace('&', '')
-            if needle in stem or stem in needle:
+            suf = f.suffix.lower()
+            if suf in ('.tmp', '.part') or suf in _META_EXT:
+                continue
+            stem = _norm_rom_key(f.stem)
+            if needle and (needle in stem or stem in needle):
                 return str(f)
     return None
 
@@ -869,6 +423,14 @@ def download_rom(system_id, filename, url):
     tmp_file = dest_file.with_suffix(dest_file.suffix + '.tmp')
     try:
         headers = {'User-Agent': 'KenteKorner/1.0'}
+        # Some provider CDNs (Vimm's dl*.vimm.net) hot-link-protect and
+        # refuse blank/unknown Referers — inject the matching origin.
+        try:
+            _dl_host = (urllib.parse.urlparse(url).hostname or '').lower()
+        except Exception:
+            _dl_host = ''
+        _ref = _rom_upstream_referer(_dl_host)
+        if _ref: headers['Referer'] = _ref
         req     = urllib.request.Request(url, headers=headers)
         # 30 s covers each blocking socket read; wall-clock cap below covers
         # slow-but-continuous transfers that would otherwise run for hours.
@@ -895,11 +457,19 @@ def download_rom(system_id, filename, url):
         # Atomic promotion: replace dest only after a complete write
         tmp_file.replace(dest_file)
         return True, str(dest_file), received
+    except urllib.error.HTTPError as e:
+        # Surface upstream HTTP status (archive.org returns 503 under load,
+        # 500 when a CDN node is broken for that item) so the UI/log can
+        # tell the user it's an upstream issue rather than a local bug.
+        tmp_file.unlink(missing_ok=True)
+        if dest_file.exists() and dest_file.stat().st_size == 0:
+            dest_file.unlink(missing_ok=True)
+        return False, f'Upstream {e.code} {e.reason} ({_dl_host})', 0
     except Exception as e:
         tmp_file.unlink(missing_ok=True)   # clean up incomplete temp file
         if dest_file.exists() and dest_file.stat().st_size == 0:
             dest_file.unlink(missing_ok=True)
-        return False, str(e), 0
+        return False, f'{type(e).__name__}: {e}', 0
     finally:
         with _DOWNLOAD_LOCK:
             _active_downloads.discard(dest_key)
@@ -931,17 +501,19 @@ def launch_game(system_id, rom_path):
     global active_proc
     folder = SYSTEM_FOLDER.get(system_id)
     if not folder:
-        return False, f'Unknown system: {system_id}'
+        return False, f'Unknown system: {system_id}', 'UNKNOWN_SYSTEM'
     if not Path(rom_path).exists():
-        return False, 'ROM file not found on disk'
+        return False, 'ROM file not found on disk', 'ROM_MISSING'
 
     launcher = Path('/usr/bin/emulatorlauncher')
     if not launcher.exists():
         # Not Batocera — use the native desktop emulator (Dolphin, PCSX2, etc.)
-        ok, method, error = find_and_launch_rom(system_id, rom_path)
+        ok, method, err_code, err_msg = find_and_launch_rom(system_id, rom_path)
         if ok:
-            return True, method
-        return False, error or f'No emulator found for {system_id} — is one installed?'
+            return True, method, None
+        msg = err_msg or f'Launch failed for {system_id}'
+        code = err_code or 'LAUNCH_FAILED'
+        return False, msg, code
 
     try:
         proc = subprocess.Popen(
@@ -966,7 +538,7 @@ def launch_game(system_id, rom_path):
                 except Exception:
                     pass
                 detail = stderr_text or f'exit {exit_code}'
-                return False, f'emulatorlauncher failed ({detail}) — check emulator install for {folder}'
+                return False, f'emulatorlauncher failed ({detail}) — check emulator install for {folder}', 'LAUNCHER_FAILED'
             # exit_code 0 in < 2 s: unusual but treat as clean handoff
         except subprocess.TimeoutExpired:
             pass  # Still running after 2 s → emulator is loading normally ✓
@@ -975,9 +547,9 @@ def launch_game(system_id, rom_path):
             proc.wait()
             _refocus_browser()
         threading.Thread(target=_wait_refocus, daemon=True).start()
-        return True, 'launched'
+        return True, 'launched', None
     except Exception as e:
-        return False, str(e)
+        return False, str(e), 'LAUNCH_EXCEPTION'
 
 def launch_native_app(exe_path=None, linux_exe=None):
     """Launch a native game executable.
@@ -1068,6 +640,177 @@ def _launch_via_wsl(linux_exe):
     except Exception as e:
         return False, str(e)
 
+def _safe_zip_extract(zip_path: Path, dest_dir: Path, max_files=5000, max_total_bytes=120 * 1024**3):
+    """Safely extract a zip file into dest_dir (ZipSlip + basic bomb limits)."""
+    import zipfile as _zf
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_abs = os.path.abspath(str(dest_dir))
+    total = 0
+    with _zf.ZipFile(str(zip_path)) as zf:
+        infos = zf.infolist()
+        if len(infos) > max_files:
+            raise RuntimeError(f'Zip has too many files ({len(infos)} > {max_files})')
+        for info in infos:
+            # Directories are represented either by trailing slash or external attrs.
+            name = info.filename
+            if not name or name.endswith('/'):
+                continue
+            if '\x00' in name:
+                raise RuntimeError('Zip contains NUL in filename')
+            total += int(getattr(info, 'file_size', 0) or 0)
+            if total > max_total_bytes:
+                raise RuntimeError('Zip uncompressed size too large')
+            # Zip uses forward slashes; os.path handles it fine on Windows.
+            out_path = os.path.abspath(os.path.join(dest_abs, name))
+            if os.path.commonpath([dest_abs, out_path]) != dest_abs:
+                raise RuntimeError(f'Blocked unsafe zip path: {name}')
+            zf.extract(info, dest_abs)
+
+def _extract_rom_container(system_id: str, rom_file: Path) -> Path:
+    """Extract a ROM container (.zip/.7z) to a stable cache dir and return the inner ROM path."""
+    rom_file = Path(rom_file)
+    st = rom_file.stat()
+    cache_root = ROMS_DIR / '_extracted' / (system_id or 'unknown')
+    # Hash key includes mtime/size so updated archives re-extract automatically.
+    key = hashlib.sha256(f'{rom_file.resolve()}|{st.st_size}|{int(st.st_mtime)}'.encode('utf-8', errors='ignore')).hexdigest()[:16]
+    dest = cache_root / key
+    meta = dest / '_meta.json'
+
+    if meta.exists():
+        try:
+            m = json.loads(meta.read_text(encoding='utf-8', errors='replace'))
+            if m.get('size') == st.st_size and m.get('mtime') == int(st.st_mtime):
+                chosen_rel = m.get('chosen')
+                if chosen_rel:
+                    chosen = dest / chosen_rel
+                    if chosen.exists():
+                        return chosen
+        except Exception:
+            pass
+
+    if dest.exists():
+        shutil.rmtree(dest, ignore_errors=True)
+    dest.mkdir(parents=True, exist_ok=True)
+
+    ext = rom_file.suffix.lower()
+    if ext == '.zip':
+        _safe_zip_extract(rom_file, dest)
+    elif ext == '.7z':
+        tar = shutil.which('tar')
+        if not tar:
+            raise RuntimeError('tar not available for .7z extraction')
+        r = subprocess.run([tar, '-xf', str(rom_file), '-C', str(dest)],
+                           capture_output=True, text=True, timeout=60 * 60)
+        if r.returncode != 0:
+            raise RuntimeError((r.stdout + r.stderr).strip()[:500] or f'tar exit {r.returncode}')
+    else:
+        raise RuntimeError(f'Unsupported ROM container type: {rom_file.name}')
+
+    # Pick the best inner payload for the system. The preference tuple is
+    # ranked best-first; a smaller rank wins, with file size as the tie-break
+    # so multi-disc dumps land on the largest disc image. Metadata sidecars
+    # (.txt/.nfo/.json) are excluded from the generic fallback so a stray
+    # readme can never out-rank the actual ROM/ISO.
+    _META_SIDECARS = {'.txt', '.nfo', '.md', '.json', '.xml', '.url', '.sfv', '.diz'}
+
+    def _pick_by_ext(prefer):
+        best_rank, best_size, picked = 999, -1, None
+        for p in dest.rglob('*'):
+            if not p.is_file():
+                continue
+            suf = p.suffix.lower()
+            if suf not in prefer:
+                continue
+            rank = prefer.index(suf)
+            try: size = p.stat().st_size
+            except OSError: size = 0
+            if rank < best_rank or (rank == best_rank and size > best_size):
+                best_rank, best_size, picked = rank, size, p
+        return picked
+
+    chosen = None
+    if system_id == 'ps3':
+        # PS3 — prefer folder dumps containing PS3_GAME, then ISO, then PKG.
+        for p in dest.rglob('*'):
+            if p.is_dir() and (p / 'PS3_GAME').is_dir():
+                chosen = p
+                break
+        if not chosen:
+            isos = sorted([p for p in dest.rglob('*.iso') if p.is_file()],
+                          key=lambda x: x.stat().st_size if x.exists() else 0,
+                          reverse=True)
+            if isos: chosen = isos[0]
+        if not chosen:
+            pkgs = sorted([p for p in dest.rglob('*.pkg') if p.is_file()],
+                          key=lambda x: x.stat().st_size if x.exists() else 0,
+                          reverse=True)
+            if pkgs: chosen = pkgs[0]
+    elif system_id == 'wiiu':
+        # Wii U — Cemu prefers a folder containing code/<name>.rpx; fall back
+        # to packed images (.wud/.wux) or the .rpx itself.
+        for p in dest.rglob('*'):
+            if p.is_dir() and (p / 'code').is_dir():
+                rpxs = list((p / 'code').glob('*.rpx'))
+                if rpxs:
+                    chosen = rpxs[0]
+                    break
+        if not chosen:
+            chosen = _pick_by_ext(('.wud', '.wux', '.rpx'))
+    else:
+        # Per-system preference table: extensions ranked best-first.
+        _PREFS = {
+            'ps2':       ('.chd', '.iso', '.cue', '.bin'),
+            'ps1':       ('.chd', '.pbp', '.cue', '.bin', '.iso'),
+            'psx':       ('.chd', '.pbp', '.cue', '.bin', '.iso'),
+            'psp':       ('.chd', '.cso', '.iso', '.pbp'),
+            'gamecube':  ('.rvz', '.nkit.iso', '.gcm', '.iso', '.wbfs', '.wad'),
+            'wii':       ('.rvz', '.nkit.iso', '.wbfs', '.iso', '.wad', '.gcm'),
+            '3ds':       ('.3ds', '.cci', '.cxi', '.cia'),
+            'switch':    ('.xci', '.nsp', '.nca'),
+            'saturn':    ('.chd', '.cue', '.ccd', '.iso', '.bin'),
+            'dreamcast': ('.gdi', '.chd', '.cdi', '.iso'),
+            'segacd':    ('.chd', '.cue', '.bin', '.iso'),
+            'n64':       ('.z64', '.v64', '.n64'),
+            'nds':       ('.nds',),
+            'ds':        ('.nds',),
+            'snes':      ('.sfc', '.smc'),
+            'nes':       ('.nes',),
+            'gameboy':   ('.gb',),
+            'gbc':       ('.gbc',),
+            'gba':       ('.gba',),
+            'genesis':   ('.md', '.gen', '.smd', '.bin'),
+            'mastersys': ('.sms',),
+            'gamegear':  ('.gg',),
+            'sega32x':   ('.32x',),
+            'turbografx':('.pce',),
+            'neogeo':    ('.neo',),
+            'atari2600': ('.a26', '.bin'),
+            'atari7800': ('.a78', '.bin'),
+        }
+        prefer = _PREFS.get(system_id)
+        if prefer:
+            chosen = _pick_by_ext(prefer)
+        if not chosen:
+            # Fallback: largest non-sidecar file. Skips .txt/.nfo/etc so a
+            # bundled readme never wins over the actual ROM payload.
+            files = [p for p in dest.rglob('*')
+                     if p.is_file() and p.suffix.lower() not in _META_SIDECARS]
+            if files:
+                chosen = max(files, key=lambda x: x.stat().st_size if x.exists() else 0)
+
+    if not chosen:
+        raise RuntimeError('No usable ROM file found inside archive')
+
+    try:
+        meta.write_text(json.dumps({'size': st.st_size, 'mtime': int(st.st_mtime),
+                                    'chosen': str(chosen.relative_to(dest))}, indent=2),
+                        encoding='utf-8')
+    except Exception:
+        pass
+
+    return chosen
+
 def find_and_launch_rom(system_id, rom_path):
     """Open rom_path with a known emulator for system_id.
 
@@ -1076,7 +819,7 @@ def find_and_launch_rom(system_id, rom_path):
       2. OS file-type association  (os.startfile / xdg-open)
       3. Open the containing folder in the file manager
 
-    Returns (success: bool, method: str, error: str | None)
+    Returns (success: bool, method: str, error_code: str | None, error_message: str | None)
       method is one of  'emulator:<name>' | 'os' | 'folder'
     """
     rom    = Path(rom_path)
@@ -1088,19 +831,47 @@ def find_and_launch_rom(system_id, rom_path):
         folder.mkdir(parents=True, exist_ok=True)
         try:
             subprocess.Popen(['explorer', str(folder)] if is_win else ['xdg-open', str(folder)])
-            return True, 'folder', None
+            return True, 'folder', None, None
         except Exception as e:
-            return False, '', f'ROM not found and could not open folder: {e}'
+            return False, '', 'ROM_MISSING', f'ROM not found and could not open folder: {e}'
+
+    # If the ROM is in an archive container, extract to a cache dir and launch
+    # the inner file/folder instead (many native emulators cannot boot .zip/.7z).
+    try:
+        if rom.is_file() and rom.suffix.lower() in ('.zip', '.7z'):
+            rom = _extract_rom_container(system_id, rom)
+    except Exception as _ex:
+        return False, '', 'EXTRACT_FAILED', f'Failed to extract ROM archive: {_ex}'
+
+    # ── PS3 preflight ───────────────────────────────────────────────────────
+    if system_id == 'ps3':
+        # Folder dumps must contain a PS3_GAME directory.
+        if rom.is_dir():
+            try:
+                if not (rom / 'PS3_GAME').is_dir():
+                    return False, '', 'PS3_BAD_DUMP', 'PS3 folder must contain PS3_GAME/ (folder-format disc dump)'
+            except Exception:
+                pass
+        # ISO images often require a matching disc key file next to the ISO.
+        if rom.is_file() and rom.suffix.lower() == '.iso':
+            try:
+                has_key = rom.with_suffix('.key').exists() or rom.with_suffix('.dkey').exists()
+            except Exception:
+                has_key = False
+            if not has_key:
+                return False, '', 'PS3_KEY_MISSING', 'PS3 ISO needs a matching disc key (.key/.dkey) next to it'
 
     # Per-emulator fullscreen + ROM argument builders.
     # Each lambda receives the rom Path and returns the arg list AFTER the exe.
     _EMU_ARGS = {
         'dolphin':   lambda r: ['--config', 'Display.Fullscreen=True', '-e', str(r)],
-        # PCSX2 v1.7+ (pcsx2-qt): use --fullscreen before the ISO path
-        # Old PCSX2 v1.6: uses --fullscreen after the ISO
-        'pcsx2-qt':  lambda r: ['--fullscreen', '--', str(r)],
+        # PCSX2 v1.7+ (pcsx2-qt / pcsx2-qtx64): use -fullscreen/-batch before the ISO path.
+        # Old PCSX2 v1.6: uses --fullscreen after the ISO.
+        'pcsx2-qt':  lambda r: ['-fullscreen', '-batch', '--', str(r)],
         'pcsx2':     lambda r: [str(r), '--fullscreen', '--nogui'],
-        'rpcs3':     lambda r: ['--no-gui', str(r)],
+        # RPCS3 CLI flags are inconsistent across versions; avoid --no-gui for
+        # compatibility and let the GUI handle boot/install flows.
+        'rpcs3':     lambda r: [str(r)],
         'flycast':   lambda r: [str(r)],
         'redream':   lambda r: [str(r)],
         'cemu':      lambda r: ['-f', '-g', str(r)],
@@ -1111,7 +882,21 @@ def find_and_launch_rom(system_id, rom_path):
 
     def _build_cmd(exe_str, r):
         stem = Path(exe_str).stem.lower()
-        args = _EMU_ARGS.get(stem, lambda x: [str(x)])(r)
+        # Normalize common binary name variants → arg profile.
+        key = stem
+        if stem.startswith('pcsx2-qt') or stem.startswith('pcsx2-qtx'):
+            key = 'pcsx2-qt'
+        args = _EMU_ARGS.get(key, lambda x: [str(x)])(r)
+        # Prefer portable mode for user-space PCSX2 installs so BIOS/config stays
+        # self-contained under %LOCALAPPDATA%\\Programs\\PCSX2.
+        if key == 'pcsx2-qt':
+            try:
+                exe_p = Path(exe_str)
+                localapp = os.environ.get('LOCALAPPDATA', '')
+                if localapp and str(exe_p).lower().startswith(str(Path(localapp)).lower()):
+                    args = ['-portable'] + args
+            except Exception:
+                pass
         return [exe_str] + args
 
     def _track_proc(proc):
@@ -1140,10 +925,20 @@ def find_and_launch_rom(system_id, rom_path):
             exe_str  = found
             emu_name = emu
         try:
+            # PS3: ensure RPCS3 firmware is installed before attempting to boot a game.
+            if system_id == 'ps3' and Path(exe_str).stem.lower().startswith('rpcs3'):
+                if not _rpcs3_firmware_installed(exe_str):
+                    # If the background BIOS thread is currently installing firmware, surface that.
+                    try:
+                        if _bios_dl_state.get('running') and 'rpcs3' in str(_bios_dl_state.get('phase') or '').lower():
+                            return False, '', 'PS3_FIRMWARE_INSTALLING', 'Installing PS3 firmware in RPCS3 — try again in a minute'
+                    except Exception:
+                        pass
+                    return False, '', 'PS3_FIRMWARE_MISSING', 'PS3 firmware not installed yet (PS3UPDAT.PUP)'
             cmd  = _build_cmd(exe_str, rom)
             proc = subprocess.Popen(cmd, close_fds=True)
             threading.Thread(target=_track_proc, args=(proc,), daemon=True).start()
-            return True, f'emulator:{emu_name}', None
+            return True, f'emulator:{emu_name}', None, None
         except Exception:
             continue   # try next candidate
 
@@ -1151,23 +946,38 @@ def find_and_launch_rom(system_id, rom_path):
     if is_win:
         # For emulators installed as WinGet portables, scan the packages directory
         _WINGET_IDS = {
+            'ps2':    ('PCSX2Team.PCSX2', 'pcsx2-qt.exe'),
             'wiiu':   ('Cemu.Cemu',   'Cemu.exe'),
             'ps3':    ('RPCS3.RPCS3', 'rpcs3.exe'),
         }
         wg_pair = _WINGET_IDS.get(system_id)
         if wg_pair:
-            wg_path = _winget_portable_glob(*wg_pair)
-            if wg_path:
+            pkg_id, exe_name = wg_pair
+            alt = []
+            if system_id == 'ps2' and exe_name.lower() == 'pcsx2-qt.exe':
+                alt = ['pcsx2-qtx64.exe', 'pcsx2-qtx64-avx2.exe']
+            for exn in [exe_name] + alt:
+                wg_path = _winget_portable_glob(pkg_id, exn)
+                if not wg_path:
+                    continue
                 try:
+                    if system_id == 'ps3' and Path(wg_path).stem.lower().startswith('rpcs3'):
+                        if not _rpcs3_firmware_installed(wg_path):
+                            try:
+                                if _bios_dl_state.get('running') and 'rpcs3' in str(_bios_dl_state.get('phase') or '').lower():
+                                    return False, '', 'PS3_FIRMWARE_INSTALLING', 'Installing PS3 firmware in RPCS3 — try again in a minute'
+                            except Exception:
+                                pass
+                            return False, '', 'PS3_FIRMWARE_MISSING', 'PS3 firmware not installed yet (PS3UPDAT.PUP)'
                     cmd  = _build_cmd(wg_path, rom)
                     proc = subprocess.Popen(cmd, close_fds=True)
                     threading.Thread(target=_track_proc, args=(proc,), daemon=True).start()
-                    return True, f'emulator:{Path(wg_path).stem}', None
+                    return True, f'emulator:{Path(wg_path).stem}', None, None
                 except Exception:
                     pass
 
         _WIN_CMD_FALLBACK = {
-            'ps2':       ['pcsx2-qt', 'PCSX2'],
+            'ps2':       ['pcsx2-qt', 'pcsx2-qtx64', 'PCSX2'],
             'dreamcast': ['flycast', 'redream'],
             'gamecube':  ['Dolphin'],
             'wii':       ['Dolphin'],
@@ -1182,463 +992,24 @@ def find_and_launch_rom(system_id, rom_path):
             if not found:
                 continue
             try:
+                if system_id == 'ps3' and Path(found).stem.lower().startswith('rpcs3'):
+                    if not _rpcs3_firmware_installed(found):
+                        try:
+                            if _bios_dl_state.get('running') and 'rpcs3' in str(_bios_dl_state.get('phase') or '').lower():
+                                return False, '', 'PS3_FIRMWARE_INSTALLING', 'Installing PS3 firmware in RPCS3 — try again in a minute'
+                        except Exception:
+                            pass
+                        return False, '', 'PS3_FIRMWARE_MISSING', 'PS3 firmware not installed yet (PS3UPDAT.PUP)'
                 cmd  = _build_cmd(found, rom)
                 proc = subprocess.Popen(cmd, close_fds=True)
                 threading.Thread(target=_track_proc, args=(proc,), daemon=True).start()
-                return True, f'emulator:{cmd_name}', None
+                return True, f'emulator:{cmd_name}', None, None
             except Exception:
                 continue
 
-    # 2. Open the containing folder in the file manager as last resort.
-    # Note: os.startfile() is intentionally omitted — on Windows it shows a
-    # blocking "How do you want to open this file?" dialog for unknown extensions
-    # which freezes the server thread.
-    try:
-        if is_win:
-            subprocess.Popen(['explorer', str(rom.parent)])
-        else:
-            subprocess.Popen(['xdg-open', str(rom.parent)], close_fds=True)
-        return True, 'folder', None
-    except Exception as e:
-        return False, '', str(e)
-
-# ── Mod System ────────────────────────────────────────────────────────────────
-# Mods are folders inside workspace/mods/<gameId>/<modName>/
-# containing replacement DAT*.ssf files.
-# Originals are backed up to mods/<gameId>/_backup/ before the first apply.
-
-def _ssf2_data_dir():
-    """Return the SSF2 data directory for the current platform."""
-    if platform.system() == 'Windows':
-        return SSF2_WIN_DATA
-    return SSF2_LIN_DATA.expanduser()
-
-def _ssf2_wsl_data_dir():
-    """Return the SSF2 WSL data dir path as a Windows UNC path (\\wsl$\\Ubuntu\\...)."""
-    try:
-        # Ask WSL for the absolute path of the data dir
-        result = subprocess.run(
-            ['wsl', 'wslpath', '-w', str(SSF2_LIN_DATA)],
-            capture_output=True, text=True, timeout=4
-        )
-        p = result.stdout.strip()
-        return Path(p) if p else None
-    except Exception:
-        return None
-
-def list_mods(game_id):
-    game_mods = MODS_DIR / game_id
-    if not game_mods.exists():
-        return []
-    mods = []
-    for mod_dir in sorted(game_mods.iterdir()):
-        if not mod_dir.is_dir() or mod_dir.name.startswith('_'):
-            continue
-        ssf_files = list(mod_dir.glob('*.ssf'))
-        info_path = mod_dir / 'mod.json'
-        info = {}
-        if info_path.exists():
-            try:
-                info = json.loads(info_path.read_text(encoding='utf-8'))
-            except Exception:
-                pass
-        mods.append({
-            'id':          mod_dir.name,
-            'name':        info.get('name', mod_dir.name),
-            'author':      info.get('author', 'Unknown'),
-            'description': info.get('description', ''),
-            'characters':  info.get('characters', []),
-            'files':       [f.name for f in ssf_files],
-            'fileCount':   len(ssf_files),
-        })
-    return mods
-
-def _resolve_target(game_id):
-    """Return (target_dir, error_str).  target_dir is None on failure."""
-    if game_id == 'ssf2':
-        if platform.system() == 'Windows':
-            # Try native Windows dir first; fall back to WSL path
-            d = SSF2_WIN_DATA
-            if d.exists():
-                return d, None
-            wsl = _ssf2_wsl_data_dir()
-            if wsl and wsl.exists():
-                return wsl, None
-            return None, 'SSF2 data directory not found on Windows or WSL'
-        else:
-            d = SSF2_LIN_DATA.expanduser()
-            if d.exists():
-                return d, None
-            return None, f'SSF2 Linux data dir not found: {d}'
-    return None, f'Unknown game: {game_id}'
-
-def apply_mod(game_id, mod_id):
-    game_mods  = MODS_DIR / game_id
-    mod_dir    = game_mods / mod_id
-    if not mod_dir.exists():
-        return False, f'Mod not found: {mod_id}'
-
-    target, err = _resolve_target(game_id)
-    if not target:
-        return False, err
-
-    backup_dir = game_mods / '_backup'
-    backup_dir.mkdir(parents=True, exist_ok=True)
-
-    mod_files = list(mod_dir.glob('*.ssf'))
-    if not mod_files:
-        return False, 'No .ssf files found in this mod folder'
-
-    applied = []
-    for mf in mod_files:
-        target_file = target / mf.name
-        backup_file = backup_dir / mf.name
-        # Back up original only if a backup doesn't already exist (preserve first original).
-        if target_file.exists() and not backup_file.exists():
-            shutil.copy2(str(target_file), str(backup_file))
-        elif not target_file.exists():
-            # Mod file will be placed fresh — this is valid for add-only mods.
-            print(f'[apply_mod] {game_id}/{mod_id}: {mf.name} is a new file (no original to back up)')
-        try:
-            shutil.copy2(str(mf), str(target_file))
-            applied.append(mf.name)
-        except PermissionError:
-            # Roll back every file we already wrote so the game isn't left half-modded.
-            for name in applied:
-                rolled_target = target / name
-                rolled_backup = backup_dir / name
-                try:
-                    if rolled_backup.exists():
-                        shutil.copy2(str(rolled_backup), str(rolled_target))
-                    else:
-                        # No backup existed → original didn't exist; remove the file we added.
-                        rolled_target.unlink(missing_ok=True)
-                except Exception:
-                    pass  # best-effort rollback; log nothing to avoid masking the real error
-            return False, (
-                f'Permission denied writing to {target_file}. '
-                'On Windows, run kente-server.py as Administrator to mod the SSF2 install, '
-                'or the Linux (WSL) version will be modded instead. '
-                f'All {len(applied)} previously written file(s) have been rolled back.'
-            )
-    return True, applied
-
-def restore_mod(game_id):
-    game_mods  = MODS_DIR / game_id
-    backup_dir = game_mods / '_backup'
-    if not backup_dir.exists() or not any(backup_dir.glob('*.ssf')):
-        return True, []  # nothing to restore
-
-    target, err = _resolve_target(game_id)
-    if not target:
-        return False, err
-
-    restored = []
-    errors   = []
-    for bf in backup_dir.glob('*.ssf'):
-        target_file = target / bf.name
-        try:
-            shutil.copy2(str(bf), str(target_file))
-            bf.unlink()
-            restored.append(bf.name)
-        except (PermissionError, FileNotFoundError, OSError) as exc:
-            # Continue restoring remaining files rather than aborting.
-            # FileNotFoundError: backup was deleted between glob() and copy2().
-            # OSError: covers cross-device moves, read-only filesystems, etc.
-            # Collecting all errors lets the caller report a complete picture.
-            errors.append(f'{bf.name}: {exc}')
-    if errors:
-        return False, (
-            f'Permission denied restoring {len(errors)} file(s) — run as Administrator. '
-            f'Errors: {"; ".join(errors)}'
-        )
-    return True, restored
-
-def mod_status(game_id):
-    backup_dir = MODS_DIR / game_id / '_backup'
-    backed_up  = list(backup_dir.glob('*.ssf')) if backup_dir.exists() else []
-    return {
-        'modActive':   len(backed_up) > 0,
-        'backupCount': len(backed_up),
-    }
-
-# ── Network Management ─────────────────────────────────────────────────────────
-_IS_WINDOWS = platform.system() == 'Windows'
-
-def _net_run(args, timeout=10):
-    """Run a command and return (stdout, stderr, returncode). Never raises."""
-    try:
-        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
-        return r.stdout, r.stderr, r.returncode
-    except Exception as ex:
-        return '', str(ex), -1
-
-# ── Boxart on-demand fetcher ─────────────────────────────────────────────────
-_BOXART_DIR  = os.path.abspath('boxart')      # <project-root>/boxart/
-_ART_KEYS    = {}                              # lazy-loaded from artkeys.json / env
-_BOXART_LOCK = {}                              # per-id in-flight guard (simple dict)
-
-def _load_art_keys():
-    """Load SteamGridDB / TheGamesDB keys.
-    Priority: artkeys.json in project root  →  environment variables."""
-    global _ART_KEYS
-    if _ART_KEYS:
-        return _ART_KEYS
-    try:
-        cfg = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'artkeys.json')
-        with open(cfg, encoding='utf-8') as f:
-            _ART_KEYS = json.load(f)
-    except Exception:
-        _ART_KEYS = {}
-    _ART_KEYS.setdefault('sgdb', os.environ.get('SGDB_KEY', ''))
-    _ART_KEYS.setdefault('tgdb', os.environ.get('TGDB_KEY', ''))
-    return _ART_KEYS
-
-def _art_http_get(url, headers=None):
-    """Simple HTTP GET returning bytes, or None on error."""
-    try:
-        hdr = {'User-Agent': 'KentesKorner/1.1'}
-        if headers:
-            hdr.update(headers)
-        req = urllib.request.Request(url, headers=hdr)
-        with urllib.request.urlopen(req, timeout=12) as r:
-            data = r.read()
-        return data if len(data) > 1024 else None
-    except Exception:
-        return None
-
-def _sgdb_fetch(title, key):
-    """Fetch portrait grid art (600x900) from SteamGridDB. Returns bytes or None."""
-    auth = {'Authorization': f'Bearer {key}'}
-    try:
-        q   = urllib.parse.quote(title)
-        raw = _art_http_get(f'https://www.steamgriddb.com/api/v2/search/autocomplete/{q}',
-                            headers=auth)
-        if not raw:
-            return None
-        games = json.loads(raw).get('data', [])
-        if not games:
-            return None
-        gid = games[0]['id']
-        raw2 = _art_http_get(
-            f'https://www.steamgriddb.com/api/v2/grids/game/{gid}'
-            f'?dimensions=600x900&types=static&nsfw=false',
-            headers=auth)
-        if not raw2:
-            return None
-        grids = json.loads(raw2).get('data', [])
-        if not grids:
-            return None
-        return _art_http_get(grids[0]['url'])
-    except Exception:
-        return None
-
-def _tgdb_fetch(title, sys_id, key):
-    """Fetch front boxart from TheGamesDB. Returns bytes or None."""
-    _TGDB_PLAT = {
-        'nes':7,'snes':6,'genesis':36,'n64':3,'ps1':10,'ps2':11,
-        'gamecube':2,'gba':5,'gameboy':4,'gbc':41,'dreamcast':16,
-        'saturn':17,'neogeo':80,'turbografx':34,'atari2600':22,
-        'atari7800':23,'mastersys':35,'psp':13,'wii':9,'ps3':12,
-        'xbox360':15,'xbox':14,'wiiu':38,'switch':4924,
-    }
-    pid = _TGDB_PLAT.get(sys_id)
-    if not pid:
-        return None
-    try:
-        q = urllib.parse.urlencode({
-            'apikey': key, 'name': title, 'fields': 'boxart',
-            'filter[platform]': pid,
-        })
-        raw = _art_http_get(f'https://api.thegamesdb.net/v1.1/Games/ByGameName?{q}')
-        if not raw:
-            return None
-        data  = json.loads(raw)
-        games = data.get('data', {}).get('games', [])
-        if not games:
-            return None
-        tl   = title.lower()
-        best = next((g for g in games
-                     if tl in g['game_title'].lower() or g['game_title'].lower() in tl),
-                    games[0])
-        gid  = best['id']
-        art  = data.get('include', {}).get('boxart', {})
-        base = art.get('base_url', {}).get('medium',
-                       'https://cdn.thegamesdb.net/images/medium/')
-        imgs = art.get('data', {}).get(str(gid), [])
-        front = next((i for i in imgs if i.get('side') == 'front'), None)
-        if not front:
-            return None
-        return _art_http_get(base + front['filename'])
-    except Exception:
-        return None
-
-def _boxart_fetch_online(game_id, title, sys_id=''):
-    """Try SteamGridDB → TheGamesDB. Save result to disk. Returns path or None."""
-    if _BOXART_LOCK.get(game_id):
-        return None                        # already in-flight
-    _BOXART_LOCK[game_id] = True
-    try:
-        keys = _load_art_keys()
-        os.makedirs(_BOXART_DIR, exist_ok=True)
-        dest = os.path.join(_BOXART_DIR, f'{game_id}.jpg')
-
-        data = None
-        if keys.get('sgdb'):
-            data = _sgdb_fetch(title or game_id, keys['sgdb'])
-        if not data and keys.get('tgdb'):
-            data = _tgdb_fetch(title or game_id, sys_id, keys['tgdb'])
-
-        if data:
-            with open(dest, 'wb') as f:
-                f.write(data)
-            return dest
-        return None
-    finally:
-        _BOXART_LOCK.pop(game_id, None)
-
-# ── Network helpers ───────────────────────────────────────────────────────────
-def _net_status():
-    """Return current WiFi/network connection status."""
-    result = {'connected': False, 'ssid': None, 'ip': None, 'signal': None, 'interface': None}
-    if _IS_WINDOWS:
-        out, _, _ = _net_run(['netsh', 'wlan', 'show', 'interfaces'])
-        for line in out.splitlines():
-            l = line.strip()
-            if l.startswith('SSID') and not l.startswith('BSSID'):
-                result['ssid'] = l.split(':', 1)[-1].strip() or None
-            elif l.startswith('Signal'):
-                try: result['signal'] = int(l.split(':', 1)[-1].strip().rstrip('%'))
-                except: pass
-            elif l.startswith('Name'):
-                result['interface'] = l.split(':', 1)[-1].strip()
-        result['connected'] = bool(result['ssid'])
-        if result['connected'] and result['interface']:
-            out2, _, _ = _net_run(['ipconfig'])
-            in_iface = False
-            for line in out2.splitlines():
-                if result['interface'] in line:
-                    in_iface = True
-                if in_iface and 'IPv4 Address' in line:
-                    # Remove trailing annotations like "(Preferred)" using regex
-                    raw_ip = line.split(':', 1)[-1].strip()
-                    result['ip'] = re.sub(r'\s*\(.*?\)\s*$', '', raw_ip).strip()
-                    break
-    else:
-        out, _, _ = _net_run(['nmcli', '-t', '-f', 'ACTIVE,SSID,SIGNAL', 'dev', 'wifi'])
-        for line in out.splitlines():
-            parts = line.split(':')
-            if len(parts) >= 3 and parts[0] == 'yes':
-                result['connected'] = True
-                result['ssid'] = parts[1]
-                try: result['signal'] = int(parts[2])
-                except: pass
-                break
-        out2, _, _ = _net_run(['hostname', '-I'])
-        ips = out2.strip().split()
-        if ips: result['ip'] = ips[0]
-        out3, _, _ = _net_run(['nmcli', '-t', '-f', 'DEVICE,TYPE,STATE', 'dev'])
-        for line in out3.splitlines():
-            p = line.split(':')
-            if len(p) >= 3 and p[1] == 'wifi' and 'connected' in p[2]:
-                result['interface'] = p[0]; break
-    return result
-
-def _net_scan():
-    """Scan for visible WiFi networks. Returns {'networks': [...]}."""
-    networks = []
-    if _IS_WINDOWS:
-        out, _, _ = _net_run(['netsh', 'wlan', 'show', 'networks', 'mode=Bssid'])
-        cur = {}
-        for line in out.splitlines():
-            l = line.strip()
-            if l.startswith('SSID') and not l.startswith('BSSID'):
-                if cur.get('ssid'): networks.append(cur)
-                cur = {'ssid': l.split(':', 1)[-1].strip(), 'signal': 0, 'secured': True}
-            elif l.startswith('Authentication') and cur:
-                cur['secured'] = l.split(':', 1)[-1].strip().lower() not in ('open', '')
-            elif l.startswith('Signal') and cur:
-                try: cur['signal'] = int(l.split(':', 1)[-1].strip().rstrip('%'))
-                except: pass
-        if cur.get('ssid'): networks.append(cur)
-    else:
-        out, _, _ = _net_run(
-            ['nmcli', '-t', '-f', 'SSID,SIGNAL,SECURITY,ACTIVE', 'dev', 'wifi', 'list', '--rescan', 'yes'],
-            timeout=20)
-        seen = set()
-        for line in out.splitlines():
-            p = line.split(':')
-            if len(p) < 4 or not p[0] or p[0] in seen: continue
-            seen.add(p[0])
-            try: sig = int(p[1])
-            except: sig = 0
-            networks.append({'ssid': p[0], 'signal': sig,
-                             'secured': p[2].strip() not in ('', '--'), 'active': p[3] == 'yes'})
-    networks.sort(key=lambda n: n.get('signal', 0), reverse=True)
-    return {'networks': networks}
-
-def _net_connect(ssid, password=''):
-    """Connect to a WiFi network (creates a profile on Windows via netsh XML)."""
-    if not ssid:
-        return False, 'No SSID provided'
-    if _IS_WINDOWS:
-        import xml.sax.saxutils as _sax
-        safe_ssid = _sax.escape(ssid)
-        if password:
-            safe_pw = _sax.escape(password)
-            xml_body = (f'<authEncryption><authentication>WPA2PSK</authentication>'
-                        f'<encryption>AES</encryption><useOneX>false</useOneX></authEncryption>'
-                        f'<sharedKey><keyType>passPhrase</keyType><protected>false</protected>'
-                        f'<keyMaterial>{safe_pw}</keyMaterial></sharedKey>')
-        else:
-            xml_body = ('<authEncryption><authentication>open</authentication>'
-                        '<encryption>none</encryption><useOneX>false</useOneX></authEncryption>')
-        xml_content = (
-            f'<?xml version="1.0"?>'
-            f'<WLANProfile xmlns="http://www.microsoft.com/networking/WLAN/profile/v1">'
-            f'<name>{safe_ssid}</name>'
-            f'<SSIDConfig><SSID><name>{safe_ssid}</name></SSID></SSIDConfig>'
-            f'<connectionType>ESS</connectionType><connectionMode>auto</connectionMode>'
-            f'<MSM><security>{xml_body}</security></MSM></WLANProfile>'
-        )
-        fd, tmp_xml = tempfile.mkstemp(suffix='.xml')
-        try:
-            os.write(fd, xml_content.encode()); os.close(fd)
-            _, err, rc = _net_run(['netsh', 'wlan', 'add', 'profile', f'filename={tmp_xml}'])
-            if rc != 0: return False, f'Profile error: {err.strip()}'
-            out2, err2, rc2 = _net_run(['netsh', 'wlan', 'connect', f'name={ssid}'], timeout=15)
-            return rc2 == 0, out2.strip() or err2.strip() or f'Connecting to {ssid}'
-        finally:
-            try: os.unlink(tmp_xml)
-            except: pass
-    else:
-        args = ['nmcli', 'dev', 'wifi', 'connect', ssid]
-        if password: args += ['password', password]
-        out, err, rc = _net_run(args, timeout=30)
-        return rc == 0, out.strip() or err.strip() or f'Connected to {ssid}'
-
-def _net_disconnect():
-    """Disconnect the active WiFi interface."""
-    if _IS_WINDOWS:
-        out, err, rc = _net_run(['netsh', 'wlan', 'disconnect'])
-        return rc == 0, out.strip() or err.strip()
-    else:
-        out, _, _ = _net_run(['nmcli', '-t', '-f', 'DEVICE,TYPE,STATE', 'dev'])
-        iface = next((l.split(':')[0] for l in out.splitlines()
-                      if ':wifi:' in l and 'connected' in l), None)
-        if not iface: return False, 'No active WiFi interface'
-        out2, err2, rc = _net_run(['nmcli', 'dev', 'disconnect', iface])
-        return rc == 0, out2.strip() or err2.strip()
-
-def _net_forget(ssid):
-    """Delete a saved network profile."""
-    if not ssid: return False, 'No SSID provided'
-    if _IS_WINDOWS:
-        out, err, rc = _net_run(['netsh', 'wlan', 'delete', 'profile', f'name={ssid}'])
-        return rc == 0, out.strip() or err.strip()
-    else:
-        out, err, rc = _net_run(['nmcli', 'connection', 'delete', ssid])
-        return rc == 0, out.strip() or err.strip()
+    # 2. No emulator found. Let the UI decide whether to install dependencies
+    # or fall back to "open folder" based on platform/mode.
+    return False, '', 'NO_EMULATOR', f'No emulator found for {system_id} — install required'
 
 # ── Request Handler ───────────────────────────────────────────────────────────
 
@@ -1669,6 +1040,12 @@ class KenteHandler(BaseHTTPRequestHandler):
         self.send_header('Content-Type', MIME.get(fpath.suffix.lower(), 'application/octet-stream'))
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Content-Length', len(data))
+        # HTML/JS/CSS must never be served from the browser disk cache: when
+        # we ship a frontend JS fix, the renderer has to see it on the next
+        # reload, not a stale Chromium-cached copy. Other asset types keep
+        # the default heuristic caching for performance.
+        if fpath.suffix.lower() in ('.html', '.js', '.css'):
+            self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
         self.end_headers()
         self.wfile.write(data)
 
@@ -1676,9 +1053,52 @@ class KenteHandler(BaseHTTPRequestHandler):
         """Serve EmulatorJS assets:
         - Community cores (flycast) → served from local EJS_CORES_DIR cache,
           downloading from GitHub releases on first request.
-        - Everything else → transparent proxy to cdn.emulatorjs.org/stable/data/
+        - Everything else → serve from local EJS_STABLE_DIR cache/mirror when
+          present, otherwise transparently proxy to cdn.emulatorjs.org/stable/data/
         CORS header is always added so the browser page can load the JS/WASM.
         """
+        # 1) Serve from local stable cache/mirror if present.
+        stable_path = _safe_resolve_helper(EJS_STABLE_DIR, '/' + (subpath or ''))
+        if stable_path is None:
+            self.send_response(403); self.end_headers(); return
+        if stable_path.exists() and stable_path.is_file():
+            data = stable_path.read_bytes()
+            self.send_response(200)
+            self.send_header('Content-Type', MIME.get(stable_path.suffix.lower(), 'application/octet-stream'))
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
+        # 1b) Serve from packaged seed pack (WEB_DIR/cache/ejs-stable) when present.
+        # This enables fully-offline play on first launch when the installer bundles
+        # an offline EmulatorJS pack.
+        try:
+            if EJS_SEED_DIR.exists():
+                seed_path = _safe_resolve_helper(EJS_SEED_DIR, '/' + (subpath or ''))
+                if seed_path is not None and seed_path.exists() and seed_path.is_file():
+                    data = seed_path.read_bytes()
+                    # Best-effort: write-through into user cache so subsequent loads
+                    # continue to work even if WEB_DIR is moved/removed.
+                    try:
+                        EJS_STABLE_DIR.mkdir(parents=True, exist_ok=True)
+                        stable_path.parent.mkdir(parents=True, exist_ok=True)
+                        tmp = stable_path.with_name(stable_path.name + '.tmp')
+                        tmp.write_bytes(data)
+                        tmp.replace(stable_path)
+                    except Exception:
+                        pass
+                    self.send_response(200)
+                    self.send_header('Content-Type', MIME.get(seed_path.suffix.lower(), 'application/octet-stream'))
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.send_header('Content-Length', str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+        except Exception:
+            pass
+
         # Community core? (e.g. cores/flycast-wasm.data or flycast-legacy-wasm.data)
         fname = subpath[len('cores/'):] if subpath.startswith('cores/') else None
         if fname and fname in COMMUNITY_CORES:
@@ -1716,12 +1136,53 @@ class KenteHandler(BaseHTTPRequestHandler):
             with urllib.request.urlopen(req, timeout=60) as resp:
                 ct   = resp.headers.get('Content-Type', 'application/octet-stream')
                 data = resp.read()
+            # Skip write-through for empty/zero-byte responses (defensive).
+            if data:
+                try:
+                    EJS_STABLE_DIR.mkdir(parents=True, exist_ok=True)
+                    stable_path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = stable_path.with_name(stable_path.name + '.tmp')
+                    tmp.write_bytes(data)
+                    tmp.replace(stable_path)
+                except Exception as _:
+                    pass
             self.send_response(200)
             self.send_header('Content-Type', ct)
             self.send_header('Access-Control-Allow-Origin', '*')
             self.send_header('Content-Length', str(len(data)))
             self.end_headers()
             self.wfile.write(data)
+        except urllib.error.HTTPError as he:
+            # Community cores (flycast, dolphin) have no report on the official
+            # CDN. Synthesize a stub with a deterministic buildStart so the
+            # browser-side IndexedDB core cache is effective (otherwise EJS
+            # falls back to Math.random() and re-downloads every launch).
+            if he.code == 404 and subpath.startswith('cores/reports/') and subpath.endswith('.json'):
+                core_name = subpath[len('cores/reports/'):-len('.json')]
+                stub = {
+                    'core': core_name,
+                    'buildStart': f'{core_name}-community-1',
+                    'options': {},
+                }
+                payload = json.dumps(stub).encode('utf-8')
+                try:
+                    EJS_STABLE_DIR.mkdir(parents=True, exist_ok=True)
+                    stable_path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = stable_path.with_name(stable_path.name + '.tmp')
+                    tmp.write_bytes(payload)
+                    tmp.replace(stable_path)
+                except Exception:
+                    pass
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.send_header('Content-Length', str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            print(f'[ejs-proxy] {subpath}: HTTP {he.code}')
+            self.send_response(he.code if 400 <= he.code < 600 else 502)
+            self.end_headers()
         except Exception as e:
             print(f'[ejs-proxy] {subpath}: {e}')
             self.send_response(502); self.end_headers()
@@ -1933,6 +1394,8 @@ class KenteHandler(BaseHTTPRequestHandler):
             self.send_json(out)
         elif path == '/api/emulators/install/status':
             self.send_json(dict(_emu_install_state))
+        elif path == '/api/ejs/prefetch/status':
+            self.send_json(dict(_ejs_prefetch_state))
         elif path == '/api/system/info':
             self.send_json(system_info())
         elif path == '/api/saves':
@@ -1989,12 +1452,20 @@ class KenteHandler(BaseHTTPRequestHandler):
             if not url:
                 self.send_json({'error': 'Missing url parameter'}, 400); return
             parsed  = urllib.parse.urlparse(url)
-            allowed = parsed.hostname and (
-                parsed.hostname == 'archive.org' or
-                parsed.hostname.endswith('.archive.org')
-            )
-            if not allowed:
+            host    = (parsed.hostname or '').lower()
+            # Allowlist centralised in _rom_host_ok() so background downloads
+            # and the streaming proxy stay in sync.  Vimm's dlN.vimm.net
+            # load-balanced subdomains are matched by regex.
+            if not _rom_host_ok(host):
                 self.send_json({'error': 'URL host not allowed'}, 403); return
+
+            # Detect "orphan .cue" downloads on archive.org and transparently
+            # switch to bundle mode: fetch cue + sibling .bin tracks, pack as
+            # a single .zip on the fly, stream that to the client.  Saved
+            # filename is rewritten <stem>.zip so EJS auto-extracts the bundle.
+            bundle_info = _archive_cue_components(url) if url.lower().endswith('.cue') else None
+            if bundle_info and fname and fname.lower().endswith('.cue'):
+                fname = Path(fname).stem + '.zip'
 
             # Resolve disk save destination — Batocera and Electron app mode.
             # Both modes have a writable ROMS_DIR; dev/browser mode does not.
@@ -2024,10 +1495,61 @@ class KenteHandler(BaseHTTPRequestHandler):
                         _active_downloads.add(str(candidate))
                         dest_file = candidate
 
+            # ── Bundle path: archive.org .cue + sibling .bin → synthetic zip ──
+            if bundle_info:
+                ident, cue_name, tracks, cue_text = bundle_info
+                print(f'[ROM Proxy/bundle] {ident}: {cue_name} + {len(tracks)} track(s)')
+                try:
+                    spool = _build_cue_bundle_zip(ident, cue_name, cue_text, tracks)
+                    spool.seek(0, 2)
+                    total = spool.tell()
+                    spool.seek(0)
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/zip')
+                    self.send_header('Content-Length', str(total))
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.send_header('Access-Control-Expose-Headers', 'X-Kente-Saved-Path')
+                    if dest_file:
+                        self.send_header('X-Kente-Saved-Path', str(dest_file))
+                    self.end_headers()
+                    f_out = open(dest_file, 'wb') if dest_file else None
+                    try:
+                        while True:
+                            chunk = spool.read(262144)
+                            if not chunk: break
+                            self.wfile.write(chunk)
+                            if f_out: f_out.write(chunk)
+                    finally:
+                        if f_out: f_out.close()
+                        try: spool.close()
+                        except Exception: pass
+                        if dest_file:
+                            with _DOWNLOAD_LOCK:
+                                _active_downloads.discard(str(dest_file))
+                except Exception as e:
+                    print(f'[ROM Proxy/bundle] failed: {type(e).__name__}: {e}')
+                    if dest_file:
+                        try:
+                            if dest_file.exists(): dest_file.unlink()
+                        except Exception: pass
+                        with _DOWNLOAD_LOCK:
+                            _active_downloads.discard(str(dest_file))
+                    try:
+                        self.send_json({
+                            'error': f'cue+bin bundling failed: {type(e).__name__}',
+                            'code':  'BUNDLE_FAILED',
+                        }, 502)
+                    except Exception:
+                        pass
+                return
+
             try:
-                req = urllib.request.Request(url, headers={
-                    'User-Agent': 'Mozilla/5.0 (compatible; KenteKorner/1.0)',
-                })
+                hdrs = {'User-Agent': 'Mozilla/5.0 (compatible; KenteKorner/1.0)'}
+                # Vimm's dl* CDN refuses requests without a vimm.net Referer;
+                # inject the right one based on the upstream host.
+                _ref = _rom_upstream_referer(host)
+                if _ref: hdrs['Referer'] = _ref
+                req = urllib.request.Request(url, headers=hdrs)
                 with urllib.request.urlopen(req, timeout=300) as resp:
                     ct = resp.headers.get('Content-Type', 'application/octet-stream')
                     cl = resp.headers.get('Content-Length', '')
@@ -2043,8 +1565,10 @@ class KenteHandler(BaseHTTPRequestHandler):
 
                     f_out = open(dest_file, 'wb') if dest_file else None
                     try:
+                        # Larger chunks reduce Python overhead and generally improve
+                        # throughput for large ROM/ISO transfers.
                         while True:
-                            chunk = resp.read(65536)
+                            chunk = resp.read(262144)
                             if not chunk:
                                 break
                             self.wfile.write(chunk)
@@ -2067,10 +1591,40 @@ class KenteHandler(BaseHTTPRequestHandler):
                             with _DOWNLOAD_LOCK:
                                 _active_downloads.discard(str(dest_file))
 
-            except Exception as e:
-                print(f'[ROM Proxy] {e}')
+            except urllib.error.HTTPError as e:
+                # Forward the upstream status verbatim so the UI can show
+                # "DOWNLOAD FAILED (UPSTREAM 503)" instead of a flat 502.
+                # Common: archive.org returns 503 when load-balancers throttle,
+                # 500 when a CDN node is broken for a specific item.
+                print(f'[ROM Proxy] upstream {e.code} for {host}: {e.reason}')
                 try:
-                    self.send_json({'error': 'ROM proxy failed'}, 502)
+                    self.send_json({
+                        'error':         f'Upstream {e.code} {e.reason}',
+                        'upstreamStatus': e.code,
+                        'upstreamHost':   host,
+                        'code':           'UPSTREAM_HTTP_ERROR',
+                    }, 502)
+                except Exception:
+                    pass
+            except urllib.error.URLError as e:
+                # DNS / connection refused / TLS handshake — distinct signal
+                # from "upstream returned an HTTP error".
+                print(f'[ROM Proxy] network error for {host}: {e}')
+                try:
+                    self.send_json({
+                        'error':       f'Network error reaching {host}',
+                        'upstreamHost': host,
+                        'code':         'UPSTREAM_NETWORK_ERROR',
+                    }, 502)
+                except Exception:
+                    pass
+            except Exception as e:
+                print(f'[ROM Proxy] {type(e).__name__}: {e}')
+                try:
+                    self.send_json({
+                        'error': f'ROM proxy failed: {type(e).__name__}',
+                        'code':  'PROXY_INTERNAL_ERROR',
+                    }, 502)
                 except Exception:
                     pass  # headers may already be sent; nothing more we can do
 
@@ -2259,6 +1813,22 @@ class KenteHandler(BaseHTTPRequestHandler):
         # ── EmulatorJS CDN proxy ─────────────────────────────────────────────
         # /api/ejs/<subpath>  transparently proxies to cdn.emulatorjs.org/stable/data/
         # Community cores (e.g. flycast) are served from a local cache instead.
+        # /api/ejs/extract-core?name=<corename>.data  fallback for the upstream
+        # browser 7z worker — returns extracted file contents as JSON+base64
+        # so js/ejs_patches.js can synthesize the decompression result when the worker
+        # silently emits zero files.
+        elif path == '/api/ejs/extract-core':
+            import base64 as _b64
+            name = qs.get('name', [''])[0]
+            files = _ejs_get_extracted_core(name)
+            if files is None:
+                self.send_json({'success': False, 'error': 'Core not found or extraction failed',
+                                'name': name}, 404)
+            else:
+                payload = {'success': True, 'name': name,
+                           'files': [{'name': k, 'data': _b64.b64encode(v).decode('ascii')}
+                                     for k, v in files.items()]}
+                self.send_json(payload)
         elif path.startswith('/api/ejs/'):
             subpath = path[len('/api/ejs/'):]
             self._serve_ejs(subpath)
@@ -2280,9 +1850,12 @@ class KenteHandler(BaseHTTPRequestHandler):
             # Accept both numeric ('5') and seasoned ('s1-e5') episode tokens.
             # Embed providers parse seasoned forms internally; scraper providers
             # only expect ints, so we coerce when possible.
+            _EMBED_PROVIDERS = ('vidsrc', '2embed', 'vidsrcpm', 'multiembed',
+                                'vidsrcnet', 'embedsu', 'vidlink', 'autoembed',
+                                '2embedstream')
             def _ep_token(raw, prov):
                 if not raw: return None
-                if prov in ('vidsrc', '2embed', 'vidsrcpm', 'multiembed', 'youtube'):
+                if prov in _EMBED_PROVIDERS or prov == 'youtube':
                     return raw   # let the embed/youtube module parse it
                 try: return int(raw)
                 except (TypeError, ValueError): return None
@@ -2306,7 +1879,7 @@ class KenteHandler(BaseHTTPRequestHandler):
                     # Embed providers accept an optional title hint that lets
                     # cold-cache deep links (e.g. from My List after a server
                     # restart) resolve their metadata.
-                    if provider in ('vidsrc', '2embed', 'vidsrcpm', 'multiembed', 'youtube'):
+                    if provider in _EMBED_PROVIDERS or provider == 'youtube':
                         hint = qs.get('title', [None])[0]
                         if hint: det_kwargs['title_hint'] = hint
                     out = theater.call(provider, 'details', **det_kwargs)
@@ -2317,7 +1890,7 @@ class KenteHandler(BaseHTTPRequestHandler):
                     # Title hint: lets the embed source-switcher resolve the
                     # AniList id for anime-only hosts (vidplus) when reached
                     # via a deep link / cold reverse-lookup cache.
-                    if provider in ('vidsrc', '2embed', 'vidsrcpm', 'multiembed'):
+                    if provider in _EMBED_PROVIDERS:
                         hint = qs.get('title', [None])[0]
                         if hint:
                             try:
@@ -2386,6 +1959,19 @@ class KenteHandler(BaseHTTPRequestHandler):
                         served_path = alt
                         break
 
+            # Packaged builds ship a small starter set of boxart under WEB_DIR/boxart.
+            # Use it as a read-only fallback when nothing is cached yet in _BOXART_DIR.
+            if not served_path:
+                try:
+                    web_art_dir = (WEB_DIR / 'boxart')
+                    for ext in ('jpg', 'png', 'webp', 'jpeg'):
+                        p = web_art_dir / f'{gid}.{ext}'
+                        if p.exists():
+                            served_path = str(p)
+                            break
+                except Exception:
+                    pass
+
             # Fetch online if not cached
             if not served_path:
                 title  = qs.get('title', [gid])[0]
@@ -2449,24 +2035,54 @@ class KenteHandler(BaseHTTPRequestHandler):
                 self.send_json({'started': False, 'reason': 'already_running',
                                 'state': dict(_emu_install_state)})
                 return
+            # Optional: restrict install to a single system/emulator.
+            system_id = (body.get('systemId') or body.get('system_id') or '').strip()
+            only_keys = None
+            if system_id:
+                only_keys = [k for k, dep in EMULATOR_DEPS.items()
+                             if system_id in (dep.get('systems') or [])]
+                if not only_keys:
+                    self.send_json({'started': False, 'reason': 'unknown_system',
+                                    'message': f'No emulator dependency is registered for systemId={system_id}'}, 400)
+                    return
             import threading as _th
-            t = _th.Thread(target=_emulator_install_thread, daemon=True)
+            t = _th.Thread(target=_emulator_install_thread, args=(only_keys,), daemon=True)
             t.start()
             self.send_json({'started': True,
                             'message': 'Emulator install started — poll /api/emulators/install/status'})
             return
 
+        elif path == '/api/ejs/prefetch':
+            # Download EmulatorJS stable assets and cores into the user cache so
+            # browser-mode emulation works offline after the first run.
+            if _ejs_prefetch_state.get('running'):
+                self.send_json({'started': False, 'reason': 'already_running',
+                                'state': dict(_ejs_prefetch_state)})
+                return
+            cores = body.get('cores')
+            if cores and isinstance(cores, list):
+                cores = [str(c).strip() for c in cores if str(c).strip()]
+            else:
+                cores = None
+            import threading as _th
+            t = _th.Thread(target=_ejs_prefetch_thread, args=(cores,), daemon=True)
+            t.start()
+            self.send_json({'started': True,
+                            'message': 'EJS prefetch started — poll /api/ejs/prefetch/status'})
+            return
+
         elif path == '/api/bios/download':
-            # Start the BIOS background download (idempotent — ignored if already running)
+            # Start the BIOS background verifier/configurer (idempotent — ignored if already running)
             if _bios_dl_state.get('running'):
                 self.send_json({'started': False, 'reason': 'already_running',
                                 'state': dict(_bios_dl_state)})
                 return
+            allow_download = bool(body.get('allowDownload') or body.get('allow_download') or False)
             import threading as _th
-            t = _th.Thread(target=_bios_download_thread, daemon=True)
+            t = _th.Thread(target=_bios_download_thread, args=(allow_download,), daemon=True)
             t.start()
             self.send_json({'started': True,
-                            'message': 'BIOS download started — poll /api/bios/download/status'})
+                            'message': 'BIOS check started — poll /api/bios/download/status'})
             return
 
         elif path == '/api/settings':
@@ -2541,11 +2157,12 @@ class KenteHandler(BaseHTTPRequestHandler):
             # Only allow downloads from the one host the UI uses.
             # file://, ftp://, or arbitrary HTTP hosts are all rejected here.
             try:
-                parsed_host = urllib.parse.urlparse(url).hostname or ''
+                parsed_host = (urllib.parse.urlparse(url).hostname or '').lower()
             except Exception:
                 parsed_host = ''
-            ALLOWED_HOSTS = {'archive.org', 'ia800100.us.archive.org'}
-            if not (parsed_host == 'archive.org' or parsed_host.endswith('.archive.org')):
+            # Mirrors the /api/rom-proxy allowlist so registered providers can
+            # save through the background download path as well.
+            if not _rom_host_ok(parsed_host):
                 self.send_json({'success': False, 'error': 'URL host not allowed'}, 403)
                 return
 
@@ -2609,8 +2226,11 @@ class KenteHandler(BaseHTTPRequestHandler):
                 rom_dir = str(ROMS_DIR / (SYSTEM_FOLDER.get(sid) or sid))
                 self.send_json({'success': False, 'error': 'ROM_NOT_FOUND', 'romDir': rom_dir}, 422)
                 return
-            ok, msg = launch_game(sid, rom_path)
-            self.send_json({'success': ok, 'message': msg})
+            ok, msg, err = launch_game(sid, rom_path)
+            out = {'success': ok, 'message': msg}
+            if not ok and err:
+                out['error'] = err
+            self.send_json(out)
 
         elif path == '/api/launch-rom':
             # Open a downloaded ROM with a locally-installed emulator (non-Batocera host).
@@ -2622,8 +2242,8 @@ class KenteHandler(BaseHTTPRequestHandler):
                 return
             folder   = SYSTEM_FOLDER.get(sid, sid)
             rom_path = str(ROMS_DIR / folder / filename)
-            ok, method, error = find_and_launch_rom(sid, rom_path)
-            self.send_json({'success': ok, 'method': method, 'error': error})
+            ok, method, err_code, err_msg = find_and_launch_rom(sid, rom_path)
+            self.send_json({'success': ok, 'method': method, 'error': err_code, 'message': err_msg})
 
         else:
             self.send_json({'error': 'Not found'}, 404)
@@ -2642,4 +2262,3 @@ if __name__ == '__main__':
         server.serve_forever()
     except KeyboardInterrupt:
         print('[Kente Server] Stopped.')
-

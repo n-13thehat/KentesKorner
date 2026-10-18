@@ -512,29 +512,53 @@ def _2embedstream_embed_url(kind, tt, season=None, episode=None):
         return f'https://www.2embedstream.xyz/embed/tv/{tt}'
     return f'https://www.2embedstream.xyz/embed/movie/{tt}'
 
-def _vidplus_anime_embed_url(kind, anilist_id, season=None, episode=None):
+def _vidplus_anime_embed_url(kind, anilist_id, season=None, episode=None, dub=False):
     # vidplus.to \u2014 anime player keyed by AniList id + episode. Series only;
     # movies/specials with a single episode resolve fine at episode=1.
+    # `dub=True` adds ?dub=true so the player loads the English-dub track when
+    # the title has one; otherwise the default subbed (Japanese) track plays.
     ep = int(episode) if episode else 1
-    return f'https://player.vidplus.to/embed/anime/{int(anilist_id)}/{ep}'
+    base = f'https://player.vidplus.to/embed/anime/{int(anilist_id)}/{ep}'
+    return base + ('?dub=true' if dub else '')
+
+
+def _vidsrcicu_anime_embed_url(kind, anilist_id, season=None, episode=None, dub=False):
+    # vidsrc.icu \u2014 anime player keyed by AniList id + episode. Trailing
+    # path segment is 1 for dub, 0 for sub.
+    ep = int(episode) if episode else 1
+    flag = 1 if dub else 0
+    return f'https://vidsrc.icu/embed/anime/{int(anilist_id)}/{ep}/{flag}'
 
 
 # Ordered list of (key, label, builder, flags) tuples used by _all_embed_sources().
 # `flags` is an optional dict:
 #   id_kind:    'imdb' (default) | 'anilist'  \u2014 selects which id is fed to the builder.
 #   anime_only: True              \u2014 entry only included when AniList resolves the title.
+#   audio:      'sub' | 'dub'     \u2014 anime audio variant; surfaces in the label so
+#                                   the source switcher shows SUB / DUB explicitly.
 # Order = preferred trial order when the user cycles via the source switcher.
 _EMBED_SOURCES = [
-    ('vidsrc',       'VIDSRC',       _vidsrc_embed_url,        {}),
-    ('vidsrcnet',    'VIDSRC.NET',   _vidsrcnet_embed_url,     {}),
-    ('2embed',       '2EMBED',       _twoembed_embed_url,      {}),
-    ('embedsu',      'EMBED.SU',     _embedsu_embed_url,       {}),
-    ('vidlink',      'VIDLINK',      _vidlink_embed_url,       {}),
-    ('autoembed',    'AUTOEMBED',    _autoembed_embed_url,     {}),
-    ('vidplus',      'VIDPLUS',      _vidplus_anime_embed_url, {'id_kind': 'anilist', 'anime_only': True}),
-    ('2embedstream', '2EMBEDSTREAM', _2embedstream_embed_url,  {}),
-    ('vidsrcpm',     'VIDSRC.PM',    _vidsrcpm_embed_url,      {}),
-    ('multiembed',   'MULTIEMBED',   _multiembed_embed_url,    {}),
+    ('vidsrc',         'VIDSRC',           _vidsrc_embed_url,        {}),
+    ('vidsrcnet',      'VIDSRC.NET',       _vidsrcnet_embed_url,     {}),
+    ('2embed',         '2EMBED',           _twoembed_embed_url,      {}),
+    ('embedsu',        'EMBED.SU',         _embedsu_embed_url,       {}),
+    ('vidlink',        'VIDLINK',          _vidlink_embed_url,       {}),
+    ('autoembed',      'AUTOEMBED',        _autoembed_embed_url,     {}),
+    ('vidplus_sub',    'VIDPLUS · SUB',
+        lambda k, i, s, e: _vidplus_anime_embed_url(k, i, s, e, dub=False),
+        {'id_kind': 'anilist', 'anime_only': True, 'audio': 'sub'}),
+    ('vidplus_dub',    'VIDPLUS · DUB',
+        lambda k, i, s, e: _vidplus_anime_embed_url(k, i, s, e, dub=True),
+        {'id_kind': 'anilist', 'anime_only': True, 'audio': 'dub'}),
+    ('vidsrcicu_sub',  'VIDSRC.ICU · SUB',
+        lambda k, i, s, e: _vidsrcicu_anime_embed_url(k, i, s, e, dub=False),
+        {'id_kind': 'anilist', 'anime_only': True, 'audio': 'sub'}),
+    ('vidsrcicu_dub',  'VIDSRC.ICU · DUB',
+        lambda k, i, s, e: _vidsrcicu_anime_embed_url(k, i, s, e, dub=True),
+        {'id_kind': 'anilist', 'anime_only': True, 'audio': 'dub'}),
+    ('2embedstream',   '2EMBEDSTREAM',     _2embedstream_embed_url,  {}),
+    ('vidsrcpm',       'VIDSRC.PM',        _vidsrcpm_embed_url,      {}),
+    ('multiembed',     'MULTIEMBED',       _multiembed_embed_url,    {}),
 ]
 
 

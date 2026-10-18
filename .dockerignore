@@ -1,0 +1,23 @@
+# Build context optimisation for `docker build -f build/Dockerfile .`
+# At runtime the script reads the repo from the bind-mounted /repo, so the
+# image itself doesn't need any of these. Keeping the context small makes
+# `docker build` fast and avoids shipping GBs of node_modules into the daemon.
+
+node_modules/
+dist/
+.git/
+.github/
+__pycache__/
+*.pyc
+*.pyo
+build/kente-server/
+ejs-cores/
+roms/
+saves/
+bios/
+Thumbs.db
+.DS_Store
+desktop.ini
+tmp_*
+.tmp_*
+build/ps4-bzImage.local

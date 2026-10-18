@@ -4,7 +4,7 @@
  *
  * Runs in the renderer context BEFORE the page script, with Node.js
  * access. Exposes a minimal, typed API to `window.electronAPI` via
- * contextBridge so kente.js can communicate with the main process
+ * contextBridge so the renderer (js/) can communicate with the main process
  * without nodeIntegration being enabled (security-safe pattern).
  */
 
@@ -29,6 +29,19 @@ contextBridge.exposeInMainWorld('electronAPI', {
    */
   showWindow: () => ipcRenderer.send('kente:showWindow'),
 
+  // ── Window controls ──────────────────────────────────────────────────────
+  /** Toggle the app window fullscreen state. */
+  toggleFullScreen: () => ipcRenderer.send('kente:window:toggleFullScreen'),
+
+  /** Set fullscreen explicitly. */
+  setFullScreen: (flag) => ipcRenderer.send('kente:window:setFullScreen', !!flag),
+
+  /** Subscribe to fullscreen state changes (F11, OS controls, etc.). */
+  onFullScreenChanged: (cb) => {
+    if (typeof cb !== 'function') return;
+    ipcRenderer.on('kente:window:fullScreenChanged', (_, fs) => cb(!!fs));
+  },
+
   // ── Discord Rich Presence ────────────────────────────────────────────────
   /**
    * Push a new Discord activity. Pass a standard discord-rpc activity object:
@@ -45,7 +58,23 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   /**
    * Register a callback fired when a native emulator exits (kente:showWindow).
-   * kente.js uses this to reset Discord presence back to "Browsing".
+   * js/room.js uses this to reset Discord presence back to "Browsing".
    */
   onDiscordReset: (cb) => ipcRenderer.on('kente:discord:reset', cb),
+
+  // ── Theater popup guard ───────────────────────────────────────────────────
+  /**
+   * Tell the main process whether the Theater overlay is on screen. While
+   * active, ad scripts inside embed iframes that call window.open(adUrl)
+   * are silently denied instead of being forwarded to the system browser,
+   * and ad-driven top-frame redirects are blocked.
+   */
+  setTheaterActive: (active) => ipcRenderer.send('kente:theater:setActive', !!active),
+
+  // ── Cursor-mode input injection (Electron only) ──────────────────────────
+  /** Move the Chromium mouse pointer (helps control cross-origin iframes). */
+  sendMouseMove: (x, y) => ipcRenderer.send('kente:input:mouseMove', { x, y }),
+
+  /** Click at (x, y) using Chromium-level input events. */
+  sendMouseClick: (x, y) => ipcRenderer.send('kente:input:mouseClick', { x, y }),
 });

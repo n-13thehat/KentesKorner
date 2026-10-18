@@ -1,9 +1,8 @@
 /* ══════════════════════════════════════════
    RomDB — IndexedDB ROM handle persistence
    ──────────────────────────────────────────
-   Extracted from kente.js as the first step toward modularising the
-   monolithic renderer.  Loaded as a separate <script> before kente.js so
-   the global `RomDB` symbol is available when the main script runs.
+   Loaded by index.html before the other js/ files so the global `RomDB`
+   symbol is available when they run.
 ══════════════════════════════════════════ */
 const RomDB = (() => {
   const DB_NAME = 'kente_roms', STORE = 'handles', VER = 1;
