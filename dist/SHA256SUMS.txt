@@ -1,0 +1,3 @@
+4d7709127dbd3eedbace7479f4afdd42254de4bc6947364ca5f9874c35703922  kentecorner-setup-7.1.4.exe
+a602552a4a905d6a8c4c2ed2842d8bd875823b30833b0d32ffb8592bfb99e657  kentecorner-setup-7.1.4.exe.blockmap
+98bec5418b4c6eeaa728cffbacbfac5ca82d25267593381a4d6f3cd35d7cb2b8  latest.yml

@@ -1,0 +1,8 @@
+version: 7.1.4
+files:
+  - url: kentecorner-setup-7.1.4.exe
+    sha512: OGn2nLs4nfV5RHJaN3ks81uoMf/ez7eLh7ybDI1muAhSDJwFI/lZqNDMKADRiry3ExdaP9K8bmwHbLIMpwRNUg==
+    size: 339502738
+path: kentecorner-setup-7.1.4.exe
+sha512: OGn2nLs4nfV5RHJaN3ks81uoMf/ez7eLh7ybDI1muAhSDJwFI/lZqNDMKADRiry3ExdaP9K8bmwHbLIMpwRNUg==
+releaseDate: '2026-10-29T23:05:56.356Z'
