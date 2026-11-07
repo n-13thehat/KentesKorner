@@ -1,0 +1,129 @@
+name: Desktop installers and release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - id: version
+        name: Read app version
+        run: |
+          version=$(node -p "require('./package.json').version")
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install packaging tools
+        run: python -m pip install pyinstaller
+      - name: Prepare optional Windows-only resource folders
+        run: mkdir -p resources/emulators resources/runtime-dlls cache/ejs-stable cache/ejs-cores
+      - run: npm ci
+      - name: Build macOS installer
+        run: npm run build:mac -- --${{ matrix.arch }} --publish never
+      - name: Give this architecture a distinct artifact name
+        run: |
+          mv dist/kentecorner-setup-${{ steps.version.outputs.value }}.dmg dist/kentecorner-setup-${{ steps.version.outputs.value }}-${{ matrix.arch }}.dmg
+          mv dist/kentecorner-setup-${{ steps.version.outputs.value }}.zip dist/kentecorner-setup-${{ steps.version.outputs.value }}-${{ matrix.arch }}.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kentecorner-macos-${{ matrix.arch }}-${{ steps.version.outputs.value }}
+          path: |
+            dist/kentecorner-setup-${{ steps.version.outputs.value }}-${{ matrix.arch }}.dmg
+            dist/kentecorner-setup-${{ steps.version.outputs.value }}-${{ matrix.arch }}.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  windows:
+    runs-on: windows-2025
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - id: version
+        name: Read app version and verify release tag
+        shell: pwsh
+        run: |
+          $version = node -p "require('./package.json').version"
+          if ($env:GITHUB_REF_NAME -ne "v$version") { throw "Tag $env:GITHUB_REF_NAME must match package version v$version" }
+          "value=$version" >> $env:GITHUB_OUTPUT
+      - name: Install packaging tools
+        run: python -m pip install pyinstaller
+      - name: Seed native engines from the previous installer
+        shell: pwsh
+        run: |
+          $seed = Get-ChildItem -LiteralPath 'dist' -Filter '*Installer.exe' -File | Sort-Object Length -Descending | Select-Object -First 1
+          if (-not $seed) { throw 'The repository must retain its previous full Windows installer to seed native engine runtimes.' }
+          $installDir = 'C:\KentePrevious'
+          $process = Start-Process -FilePath $seed.FullName -ArgumentList @('/S', "/D=$installDir") -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Previous installer exited with $($process.ExitCode)" }
+          New-Item -ItemType Directory -Force -Path 'resources/emulators' | Out-Null
+          Copy-Item -Path "$installDir/resources/emulators/*" -Destination 'resources/emulators' -Recurse -Force
+          $offlinePack = "$installDir/resources/web/cache/ejs-stable"
+          if (Test-Path -LiteralPath $offlinePack) {
+            New-Item -ItemType Directory -Force -Path 'cache/ejs-stable' | Out-Null
+            Copy-Item -Path "$offlinePack/*" -Destination 'cache/ejs-stable' -Recurse -Force
+          }
+      - name: Build Windows installer and updater metadata
+        run: npm ci; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; npm run build -- --publish never
+        shell: pwsh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kentecorner-windows-${{ steps.version.outputs.value }}
+          path: |
+            dist/kentecorner-setup-${{ steps.version.outputs.value }}.exe
+            dist/kentecorner-setup-${{ steps.version.outputs.value }}.exe.blockmap
+            dist/latest.yml
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-release:
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: kentecorner-*-${{ needs.windows.outputs.version }}
+          path: release-assets
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.windows.outputs.version }}
+          name: Kente's Korner ${{ needs.windows.outputs.version }}
+          files: release-assets/*
+          overwrite_files: true
+          body: |
+            Kente's Korner ${{ needs.windows.outputs.version }} for Windows x64 and macOS Intel/Apple Silicon.
+
+            Windows builds support native emulator launching and in-app updates. macOS builds support browser emulation; native emulator hosting is Windows-only. macOS installers are unsigned and require Gatekeeper approval.
+          draft: false
+          prerelease: false

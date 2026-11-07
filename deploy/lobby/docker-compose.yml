@@ -1,0 +1,54 @@
+services:
+  lobby:
+    build:
+      context: ../..
+      dockerfile: deploy/lobby/Dockerfile
+    restart: unless-stopped
+    environment:
+      KENTE_LOBBY_PUBLIC: "1"
+      KENTE_LOBBY_PORT: "7788"
+      KENTE_TRUST_PROXY: "1"
+      KENTE_TURN_URLS: "turn:${TURN_DOMAIN}:3478?transport=udp,turn:${TURN_DOMAIN}:3478?transport=tcp"
+      KENTE_TURN_SECRET: "${TURN_SECRET}"
+    expose:
+      - "7788"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - lobby
+    environment:
+      LOBBY_DOMAIN: "${LOBBY_DOMAIN}"
+    ports:
+      - "80:80/tcp"
+      - "443:443/tcp"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+  turn:
+    image: coturn/coturn:4.18.0-r0
+    # Host networking makes the advertised relay UDP ports reachable on Linux.
+    # This deployment file targets a Linux VPS.
+    network_mode: host
+    restart: unless-stopped
+    command:
+      - --no-cli
+      - --no-tls
+      - --no-dtls
+      - --fingerprint
+      - --use-auth-secret
+      - --static-auth-secret=${TURN_SECRET}
+      - --realm=${TURN_DOMAIN}
+      - --listening-port=3478
+      - --min-port=49160
+      - --max-port=49200
+      - --external-ip=${PUBLIC_IPV4}
+      - --no-multicast-peers
+
+volumes:
+  caddy_data:
+  caddy_config:

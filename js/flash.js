@@ -305,6 +305,13 @@ async function launchFlashGame(game) {
 }
 
 async function closeGame() {
+  // The embedded Windows player owns its process lifetime. Stop it through
+  // the session API so the emulator can flush saves before Kente clears the HUD.
+  if (window.electronAPI?.nativePlayerSupported && NativePlayer.active) {
+    await NativePlayer.stop();
+    exitEmulator();
+    return;
+  }
   // Kill the currently running native emulator process or browser-based emulator
   GamepadManager.cancelTouchpadTimer();
   hideIngameMenu(/* skipStateReset */ true);
@@ -327,6 +334,7 @@ async function closeGame() {
   if (_nativeAppPoll) { clearInterval(_nativeAppPoll); _nativeAppPoll = null; }
 
   // Clean up browser-based emulator (EmulatorJS)
+  _cancelEjsStartup?.();
   try {
     if (window.EJS_emulator) {
       window.EJS_emulator.gameManager?.worker?.terminate?.();
@@ -338,6 +346,7 @@ async function closeGame() {
   delete window.EJS_emulator;
   delete window.EJS_ready;
   delete window.EJS_onGameStart;
+  delete window.EJS_onGameError;
 
   // Remove EmulatorJS scripts
   document.getElementById('ejs-loader')?.remove();
@@ -363,7 +372,7 @@ async function closeGame() {
 
   // Clean EJS config globals
   ['EJS_player','EJS_core','EJS_gameUrl','EJS_gameName','EJS_pathtodata','EJS_startOnLoaded',
-   'EJS_color','EJS_backgroundColor','EJS_biosUrl','EJS_Buttons']
+   'EJS_color','EJS_backgroundColor','EJS_biosUrl','EJS_externalFiles','EJS_Buttons']
     .forEach(k => delete window[k]);
 
   // Restore window and state
@@ -374,6 +383,8 @@ async function closeGame() {
 }
 
 function exitEmulator() {
+  NativePlayer.stop();
+  _cancelEjsStartup?.();
   // Cancel any pending touchpad single-tap timer so it doesn't fire
   // openDownloadCenter() on a stale closure after the emulator takes over input.
   GamepadManager.cancelTouchpadTimer();
@@ -395,6 +406,7 @@ function exitEmulator() {
   delete window.EJS_emulator;
   delete window.EJS_ready;
   delete window.EJS_onGameStart;
+  delete window.EJS_onGameError;
 
   // Remove the loader script so the next launch gets a clean execution
   document.getElementById('ejs-loader')?.remove();
@@ -423,7 +435,7 @@ function exitEmulator() {
 
   // Clean EJS config globals
   ['EJS_player','EJS_core','EJS_gameUrl','EJS_gameName','EJS_pathtodata','EJS_startOnLoaded',
-   'EJS_color','EJS_backgroundColor','EJS_biosUrl','EJS_Buttons']
+   'EJS_color','EJS_backgroundColor','EJS_biosUrl','EJS_externalFiles','EJS_Buttons']
     .forEach(k => delete window[k]);
   state.screen = 'room';
   KenteAudio.setHumVol(0.018);

@@ -36,13 +36,55 @@ function _applyLibraryFilters(scope) {
 /* Search input — live-filter the Play / Collections grids while typing. */
 document.addEventListener('input', e => {
   if (e.target.id === 'play-search') _applyLibraryFilters('play');
-  else if (e.target.id === 'col-search') _applyLibraryFilters('col');
+  else if (e.target.id === 'col-search') {
+    _applyLibraryFilters('col');
+    searchCollectionProviders(e.target.value);
+  }
+});
+
+document.addEventListener('keydown', e => {
+  if (e.target?.id === 'source-game-search-input' && e.key === 'Enter') {
+    e.preventDefault();
+    searchAllGameProviders();
+    return;
+  }
+  const row = e.target?.closest?.('.settings-item.interactive, [data-net-action]');
+  if (row && (e.key === 'Enter' || e.key === ' ')) {
+    e.preventDefault();
+    row.click();
+    return;
+  }
+  const card = e.target?.closest?.('.game-card, .theater-poster');
+  if (card && e.target === card && (e.key === 'Enter' || e.key === ' ')) {
+    e.preventDefault();
+    card.click();
+  }
+});
+
+document.addEventListener('change', e => {
+  if (e.target?.id === 'source-game-search-system' &&
+      document.getElementById('source-game-search-input')?.value.trim().length >= 2) {
+    searchAllGameProviders();
+  }
 });
 
 /* ══════════════════════════════════════════
    GLOBAL CLICK DELEGATION
 ══════════════════════════════════════════ */
 document.addEventListener('click', e => {
+  if (e.target.closest('#source-game-search-button')) {
+    e.preventDefault();
+    searchAllGameProviders();
+    return;
+  }
+
+  const providerDownload = e.target.closest('[data-col-provider-index]');
+  if (providerDownload) {
+    e.preventDefault();
+    queueCollectionProviderResult(providerDownload.dataset.colProviderIndex);
+    return;
+  }
+
   // ── Theater poster cards (Netflix-style detail open) ──
   const theaterPoster = e.target.closest('.theater-poster');
   if (theaterPoster) {
@@ -195,6 +237,7 @@ document.addEventListener('click', e => {
   if (actionItem) {
     const action = actionItem.dataset.action;
     if (action === 'openChamber') openChamber();
+    if (action === 'checkUpdates') { KenteAudio.click(); checkForAppUpdatesFromSettings(); }
     if (action === 'resetSystems') {
       if (confirm('Factory reset all sacrificed systems? This cannot be undone.')) {
         resetSystemState();
@@ -203,10 +246,7 @@ document.addEventListener('click', e => {
     }
     if (action === 'addSource') {
       KenteAudio.click();
-      // Custom source linking is a planned V2 feature.
-      // For now, direct the user to the Cloud Browser — the current way to
-      // stream and save ROMs from Archive.org without any local source config.
-      showToast('⚡ USE THE CLOUD BROWSER TO ADD ROMS — OPEN IT FROM ANY GAME ZONE');
+      setRomLibraryRoot(); // Opens the folder picker and indexes local ROMs.
     }
     if (action === 'openCloud') {
       KenteAudio.click();

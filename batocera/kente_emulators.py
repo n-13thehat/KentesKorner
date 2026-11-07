@@ -2,7 +2,8 @@
 import os, platform, re, shutil, subprocess
 from pathlib import Path
 import urllib.request, urllib.parse, urllib.error
-from kente_config import BIOS_DIR, BIOS_FILES, NATIVE_EMU_WIN
+from kente_config import BASE, BIOS_DIR, BIOS_FILES, IS_APP, NATIVE_EMU_WIN
+from kente_runtime import RUNTIME_DIR, available_runtime, executable, provision_runtime
 
 # ── BIOS manager ──────────────────────────────────────────────────────────────
 # Kente does not distribute BIOS/firmware images. Users must provide their own
@@ -72,13 +73,13 @@ def _bios_configure_pcsx2(bios_dir: Path):
         chosen_bin = None
         bundle = []
     copied = []
-    roots = [default_root]
+    roots = [BASE / 'emulators/pcsx2'] if IS_APP else [default_root]
 
     # Portable root candidates (Windows): prefer LOCALAPPDATA installs.
     localapp = Path(_os.environ.get('LOCALAPPDATA', '')) if platform.system() == 'Windows' else Path('')
     try:
         p_root   = localapp / 'Programs' / 'PCSX2'
-        if p_root.exists():
+        if not IS_APP and p_root.exists():
             roots.append(p_root)
     except Exception:
         pass
@@ -88,7 +89,7 @@ def _bios_configure_pcsx2(bios_dir: Path):
             if ep.exists():
                 parent = ep.parent
                 # Only treat user-writable installs as "portable roots"
-                if str(parent).lower().startswith(str(user).lower()) or str(parent).lower().startswith(str(localapp).lower()):
+                if not IS_APP and (str(parent).lower().startswith(str(user).lower()) or str(parent).lower().startswith(str(localapp).lower())):
                     if parent not in roots:
                         roots.append(parent)
     except Exception:
@@ -272,10 +273,24 @@ EMULATOR_DEPS = {
         'winget_id':  'Cemu.Cemu',
         'win_exe':    Path(_LOCALAPP) / 'Programs' / 'Cemu' / 'Cemu.exe',
         'win_dest':   Path(_LOCALAPP) / 'Programs' / 'Cemu',
-        'win_dl':     None,   # WinGet preferred
+        'win_dl':     {'kind': 'github_release', 'repo': 'cemu-project/Cemu',
+                       'asset_re': r'windows.*x64.*\.zip$'},
         'lin_appimg': 'https://github.com/cemu-project/Cemu/releases/latest/download/Cemu-2.0-x86_64.AppImage',
     },
 }
+
+EMULATOR_DEPS.update({
+    'dolphin': {'name': 'Dolphin (GameCube / Wii)', 'systems': ['gamecube', 'wii'],
+                'win_exe': Path(_LOCALAPP) / 'Programs/Dolphin/Dolphin.exe', 'win_dl': None},
+    'xemu': {'name': 'xemu (Xbox)', 'systems': ['xbox'],
+             'win_exe': Path(_LOCALAPP) / 'Programs/xemu/xemu.exe',
+             'win_dl': {'kind': 'github_release', 'repo': 'xemu-project/xemu', 'asset_re': r'xemu-win.*\.zip$'}},
+    'xenia': {'name': 'Xenia (Xbox 360)', 'systems': ['xbox360'],
+              'win_exe': Path(_LOCALAPP) / 'Programs/Xenia/xenia.exe',
+              'win_dl': 'https://github.com/xenia-project/release/releases/latest/download/xenia_master.zip'},
+    'ryujinx': {'name': 'Switch game engine', 'systems': ['switch'],
+                'win_exe': Path(_APPDATA) / 'Ryujinx/publish/Ryujinx.exe', 'win_dl': None},
+})
 
 WINDOWS_RUNTIME_DEPS = [
     {
@@ -330,6 +345,10 @@ def _winget_portable_glob(pkg_id, exe_name):
 def _check_emu_installed(key):
     """Return (installed: bool, path: str|None) for an emulator key."""
     dep    = EMULATOR_DEPS[key]
+    if IS_APP:
+        bundled = available_runtime(key)
+        if bundled:
+            return True, str(bundled)
     is_win = platform.system() == 'Windows'
     if is_win:
         # 1. Check declared win_exe path
@@ -531,6 +550,45 @@ def _emulator_install_thread(only_keys=None):
     headers  = {'User-Agent': 'Mozilla/5.0 KenteOS/1.0'}
     keys     = list(only_keys) if only_keys else list(EMULATOR_DEPS.keys())
     targeted = only_keys is not None
+
+    if IS_APP and is_win:
+        # A desktop game installs only into Kente's private runtime folder.
+        # Do not invoke WinGet or modify an independent emulator installation.
+        for key in keys:
+            dep = EMULATOR_DEPS.get(key)
+            if not dep:
+                results[key] = {'status': 'error', 'error': 'Unknown game engine'}
+                continue
+            _emu_install_state['current'] = dep['name']
+            try:
+                installed, found = _check_emu_installed(key)
+                runtime = provision_runtime(key, found) if installed else None
+                if not runtime:
+                    dl = dep.get('win_dl')
+                    if not dl:
+                        results[key] = {'status': 'manual_required', 'reason': 'Add a portable game engine in Kente.'}
+                        continue
+                    if isinstance(dl, dict):
+                        url, name = _github_latest_release_asset(dl['repo'], dl['asset_re'], headers)
+                    else:
+                        url, name = dl, Path(urllib.parse.urlparse(dl).path).name
+                    cache = BASE / 'cache/engines'
+                    cache.mkdir(parents=True, exist_ok=True)
+                    archive = cache / f'{key}-{name}'
+                    _download_to_file(url, archive, headers=headers, timeout=600)
+                    if archive.suffix.lower() not in ('.zip', '.7z'):
+                        raise RuntimeError('This engine requires a portable ZIP or 7z package.')
+                    destination = RUNTIME_DIR / key
+                    _extract_archive_to(archive, destination)
+                    _flatten_single_subdir(destination)
+                    runtime = executable(destination, key)
+                    if not runtime:
+                        raise RuntimeError('The downloaded package did not contain its game engine.')
+                results[key] = {'status': 'ready', 'path': str(runtime)}
+            except Exception as error:
+                results[key] = {'status': 'error', 'error': str(error)}
+        _emu_install_state.update({'running': False, 'done': True, 'current': '', 'results': results})
+        return
 
     # ── Windows runtime dependencies (best-effort) ─────────────────────────
     if is_win:

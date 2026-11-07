@@ -3,29 +3,29 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <!-- Defence-in-depth CSP. Keeps scripts local while allowing the runtime
-       Blob-based scripts (EmulatorJS cores) and WebAssembly compilation that
-       browser emulation requires. -->
+  <!-- EmulatorJS loads its runtime and WASM from Blob URLs. Its archive
+       workers also compile generated JavaScript with Function(), requiring
+       unsafe-eval. Keep script sources local while permitting those operations. -->
   <meta http-equiv="Content-Security-Policy"
          content="default-src 'self';
-                 script-src 'self' blob: 'wasm-unsafe-eval';
+                 script-src 'self' blob: 'unsafe-eval' 'wasm-unsafe-eval';
                  style-src 'self' 'unsafe-inline';
                  font-src 'self' data:;
                  img-src 'self' data: blob: https: http:;
                  media-src 'self' blob: data: https: http:;
-                 connect-src 'self' https: http: ws: wss:;
+                 connect-src 'self' blob: https: http: ws: wss:;
                  frame-src 'self' https: http: blob:;
                  worker-src 'self' blob:;
                  object-src 'none';
                  base-uri 'self';
                  form-action 'self';">
-  <title>KENTE'S KORNER — BUILD 01</title>
+  <title>KENTE'S KORNER — BUILD 8.3.2</title>
   <!-- Fonts are intentionally local/offline: use system fallbacks so the app
        never depends on WAN TLS handshakes during boot. -->
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style.css?v=10">
 </head>
 <body>
-  <div id="kente-app">
+  <main id="kente-app" aria-label="Kente's Korner game room">
 
     <!-- ═══════════════ SPLASH / PRESS START SCREEN ═══════════════ -->
     <div id="splash" class="screen active">
@@ -33,7 +33,7 @@
       <div class="splash-content">
         <img src="Conceptual Artifacts/KenteCorner Logo.png" alt="Kente's Korner" id="splash-logo-img">
         <div class="press-start" id="press-start">PRESS START</div>
-        <div class="splash-build">BUILD 01 · DISC 01 · 2026</div>
+        <div class="splash-build">BUILD 8.3.2 · 2026</div>
       </div>
     </div>
 
@@ -57,7 +57,7 @@
           <button type="button" class="hud-dl-btn" id="hud-dl-btn" title="Download Center">
             ⬇ <span class="hud-dl-count" id="hud-dl-count"></span>
           </button>
-          <div class="hud-build">BUILD 01 / DISC 01</div>
+          <div class="hud-build">BUILD 8.3.2</div>
           <div class="hud-dot" id="hud-status-dot"></div>
         </div>
       </div>
@@ -134,7 +134,7 @@
     </div>
 
     <!-- Hidden ROM file input (fallback) — display controlled via CSS -->
-    <input type="file" id="rom-file-input" hidden
+    <input type="file" id="rom-file-input" aria-label="Choose a ROM file" hidden
       accept=".nes,.gb,.gbc,.gba,.sfc,.smc,.md,.bin,.gen,.sms,.a26,.a78,.n64,.z64,.v64,.pce,
               .iso,.cue,.img,.cso,.chd,
               .wbfs,.gcm,.nds,.3ds,.gcz,
@@ -144,7 +144,7 @@
     >
 
     <!-- ═══════════════ GAME DETAIL PANEL ═══════════════ -->
-    <div id="game-detail-panel">
+    <div id="game-detail-panel" role="dialog" aria-modal="true" aria-label="Game details" aria-hidden="true">
       <div id="gdp-inner"></div>
     </div>
 
@@ -179,7 +179,7 @@
 
         <!-- Search bar -->
         <div id="cloud-search-bar">
-          <input id="cloud-search-input" type="text" placeholder="SEARCH TITLES..." autocomplete="off" spellcheck="false">
+          <input id="cloud-search-input" type="search" aria-label="Search game titles" placeholder="SEARCH TITLES..." autocomplete="off" spellcheck="false">
           <button type="button" id="cloud-search-btn">SEARCH</button>
         </div>
 
@@ -188,14 +188,14 @@
 
           <div id="cloud-results-pane">
             <div id="cloud-results-label">RESULTS</div>
-            <div id="cloud-results-list">
+          <div id="cloud-results-list">
               <p class="cloud-empty">SELECT A SYSTEM AND SEARCH.</p>
             </div>
           </div>
 
           <div id="cloud-files-pane">
             <div id="cloud-files-label">FILES</div>
-            <div id="cloud-files-list">
+          <div id="cloud-files-list">
               <p class="cloud-empty">SELECT A RESULT TO SEE FILES.</p>
             </div>
           </div>
@@ -218,7 +218,7 @@
       <div id="dl-panel">
         <div id="dl-header">
           <div id="dl-title">⬇ DOWNLOADS</div>
-          <div id="dl-subtitle">Background downloads · Ready to play</div>
+          <div id="dl-subtitle" role="status" aria-live="polite">Background downloads · Ready to play</div>
           <button type="button" id="dl-close">✕</button>
         </div>
         <div id="dl-list">
@@ -438,7 +438,43 @@
       <div id="guide-panel"></div>
     </div>
 
-  </div><!-- /#kente-app -->
+    <div id="play-together-overlay" role="dialog" aria-modal="true" aria-labelledby="pt-title">
+      <section id="pt-panel">
+        <header class="pt-header">
+          <div><div class="pt-kicker">KENTE MULTIPLAYER</div><h2 id="pt-title">PLAY TOGETHER</h2></div>
+          <button type="button" id="pt-close" aria-label="Close lobby">✕</button>
+        </header>
+        <div id="pt-selected-game"></div>
+        <div id="pt-status" role="status" aria-live="polite"></div>
+        <div id="pt-start-view">
+          <label for="pt-name">PLAYER NAME</label>
+          <input id="pt-name" maxlength="24" autocomplete="nickname" placeholder="ENTER A USERNAME">
+          <button type="button" id="pt-create-btn">HOST THIS PS2 GAME</button>
+          <div class="pt-divider">OR JOIN A ROOM</div>
+          <label for="pt-host-address">LOBBY SERVER <small>local: localhost:7788 · online: https://play.example.com</small></label>
+          <input id="pt-host-address" placeholder="localhost:7788 or https://play.example.com" autocomplete="url">
+          <label for="pt-room-code">ROOM CODE</label>
+          <input id="pt-room-code" maxlength="8" placeholder="6 LETTERS / NUMBERS">
+          <button type="button" id="pt-join-btn" class="pt-secondary">JOIN ROOM</button>
+          <p class="pt-network-note">PS2 streaming supports one Player 2. Use localhost or a local IP on the same network. For different locations, both players enter the same hosted HTTPS lobby URL; the host must configure port forwarding/firewall rules for the lobby and TURN server.</p>
+        </div>
+        <div id="pt-room-view" hidden>
+          <div class="pt-code-wrap"><span>ROOM CODE</span><strong id="pt-room-code-display"></strong></div>
+          <div id="pt-room-game"></div>
+          <div id="pt-room-invite"></div>
+          <button type="button" id="pt-copy-invite" class="pt-secondary">COPY INVITE DETAILS</button>
+          <div id="pt-player-list"></div>
+          <button type="button" id="pt-ready-btn">READY UP</button>
+          <button type="button" id="pt-start-btn">START GAME</button>
+        </div>
+        <div id="pt-stream-view" hidden>
+          <p class="pt-stream-hint">YOU ARE CONNECTED AS PLAYER 2 · CLICK THE GAME AND USE WASD / IJKL</p>
+          <video id="pt-remote-video" autoplay playsinline tabindex="0" aria-label="Shared PlayStation 2 game. Use the keyboard to control Player 2."></video>
+        </div>
+      </section>
+    </div>
+
+  </main><!-- /#kente-app -->
 
   <!-- hls.js (light build) — vendored locally so the Theater works offline on
        Batocera kiosks where outbound HTTPS may be blocked. -->
@@ -448,32 +484,34 @@
   <!-- Application logic — order matters (shared global scope, see js/config.js). -->
   <script defer src="js/config.js?v=8"></script>
   <script defer src="js/ejs_patches.js?v=8"></script>
-  <script defer src="js/cloud.js?v=8"></script>
-  <script defer src="js/storage.js?v=8"></script>
-  <script defer src="js/download_manager.js?v=8"></script>
+  <script defer src="js/cloud.js?v=10"></script>
+  <script defer src="js/storage.js?v=10"></script>
+  <script defer src="js/download_manager.js?v=9"></script>
   <script defer src="js/systems.js?v=8"></script>
   <script defer src="js/fx.js?v=8"></script>
   <script defer src="js/settings.js?v=8"></script>
-  <script defer src="js/native.js?v=8"></script>
+  <script defer src="js/native_player.js?v=10"></script>
+  <script defer src="js/native.js?v=9"></script>
   <script defer src="js/rom_library.js?v=8"></script>
-  <script defer src="js/room.js?v=8"></script>
-  <script defer src="js/menus.js?v=8"></script>
-  <script defer src="js/theater.js?v=8"></script>
+  <script defer src="js/room.js?v=9"></script>
+  <script defer src="js/menus.js?v=10"></script>
+  <script defer src="js/theater.js?v=9"></script>
   <script defer src="js/osk.js?v=8"></script>
-  <script defer src="js/theater_detail.js?v=8"></script>
+  <script defer src="js/theater_detail.js?v=9"></script>
   <script defer src="js/settings_menu.js?v=8"></script>
   <script defer src="js/sacrifice.js?v=8"></script>
   <script defer src="js/game_detail.js?v=8"></script>
+  <script defer src="js/play_together.js?v=1"></script>
   <script defer src="js/rom_tools.js?v=8"></script>
   <script defer src="js/cloud_launch.js?v=8"></script>
   <script defer src="js/emulatorjs.js?v=8"></script>
   <script defer src="js/panels.js?v=8"></script>
-  <script defer src="js/flash.js?v=8"></script>
+  <script defer src="js/flash.js?v=9"></script>
   <script defer src="js/gamepad.js?v=8"></script>
   <script defer src="js/camera.js?v=8"></script>
-  <script defer src="js/theater_player.js?v=8"></script>
-  <script defer src="js/theater_embed.js?v=8"></script>
-  <script defer src="js/events.js?v=8"></script>
+  <script defer src="js/theater_player.js?v=9"></script>
+  <script defer src="js/theater_embed.js?v=9"></script>
+  <script defer src="js/events.js?v=10"></script>
   <script defer src="js/main.js?v=8"></script>
 </body>
 </html>

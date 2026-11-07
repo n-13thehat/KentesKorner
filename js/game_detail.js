@@ -79,11 +79,33 @@ function toggleFavorite(gameId) {
 // Monotonic token bumped every open/close so async ROM lookups can detect
 // they've been superseded and skip mutating a row that no longer matches.
 let _gdpOpenToken = 0;
+let _gdpReturnFocus = null;
+
+document.addEventListener('keydown', event => {
+  const panel = document.getElementById('game-detail-panel');
+  if (!panel?.classList.contains('open')) return;
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    closeGameDetail();
+    return;
+  }
+  if (event.key !== 'Tab') return;
+  const controls = [...panel.querySelectorAll('button:not(:disabled), a[href], input:not(:disabled), select:not(:disabled), [tabindex]:not([tabindex="-1"])')]
+    .filter(control => control.getClientRects().length > 0);
+  if (!controls.length) return;
+  const first = controls[0], last = controls[controls.length - 1];
+  if (event.shiftKey && (document.activeElement === first || !panel.contains(document.activeElement))) {
+    event.preventDefault(); last.focus();
+  } else if (!event.shiftKey && (document.activeElement === last || !panel.contains(document.activeElement))) {
+    event.preventDefault(); first.focus();
+  }
+});
 
 function openGameDetail(gameId) {
   const lib = window.KenteLibrary;
   const g   = lib?.games.find(g => g.id === gameId);
   if (!g) return;
+  _gdpReturnFocus = document.activeElement;
   _gdpOpenToken++;
   KenteAudio.click();
 
@@ -110,7 +132,7 @@ function openGameDetail(gameId) {
         <div class="gdp-cover-title">${escHtml(g.title)}</div>
         <div class="gdp-cover-year">${escHtml(g.year)} · ${escHtml(g.developer)}</div>
       </div>
-      <button class="gdp-close" id="gdp-close">✕</button>
+      <button type="button" class="gdp-close" id="gdp-close" aria-label="Close game details">✕</button>
     </div>
     <div class="gdp-body">
       <div class="gdp-meta">
@@ -128,6 +150,7 @@ function openGameDetail(gameId) {
           <button class="gdp-fav-btn ${isFav?'active':''}" data-gameid="${g.id}">${isFav?'★ FAVORITED':'☆ FAVORITE'}</button>
           <button class="gdp-secondary-btn" id="gdp-preview-btn">▶ PREVIEW</button>
           <button class="gdp-secondary-btn" id="gdp-manual-btn">📖 MANUAL</button>
+          ${g.systemId === 'ps2' && window.electronAPI?.nativePlayerSupported ? '<button class="gdp-secondary-btn gdp-play-together-btn" id="gdp-play-together">🎮 PLAY TOGETHER</button>' : ''}
           ${g.hasMods ? `<button class="gdp-secondary-btn" id="gdp-mods-btn" style="border-color:var(--brand);color:var(--brand)">🎨 MODS</button>` : ''}
           <button class="gdp-secondary-btn" id="gdp-pin-btn">${_getZonePinLabel(g.id)}</button>
         </div>
@@ -144,6 +167,8 @@ function openGameDetail(gameId) {
   const panel = document.getElementById('game-detail-panel');
   panel.style.setProperty('--menu-accent', accent);
   panel.classList.add('open');
+  panel.setAttribute('aria-hidden', 'false');
+  panel.querySelector('#gdp-close')?.focus({ preventScroll: true });
   panel.querySelector('#gdp-close').addEventListener('click', closeGameDetail);
   panel.querySelector('.gdp-launch-btn').addEventListener('click', () => launchGame(g));
   panel.querySelector('.gdp-fav-btn').addEventListener('click', () => toggleFavorite(g.id));
@@ -157,6 +182,7 @@ function openGameDetail(gameId) {
     const q = encodeURIComponent(g.title);
     window.open(`https://gamefaqs.gamespot.com/search?game=${q}`, '_blank', 'noopener');
   });
+  panel.querySelector('#gdp-play-together')?.addEventListener('click', () => PlayTogether.open(g));
   // Mods — opens the mod manager (only present for hasMods games)
   panel.querySelector('#gdp-mods-btn')?.addEventListener('click', () => showModManager(g));
   // Pin to TV zone
@@ -210,7 +236,9 @@ async function _loadGdpRomSection(gameId) {
 }
 
 function closeGameDetail() {
-  document.getElementById('game-detail-panel').classList.remove('open');
+  const panel = document.getElementById('game-detail-panel');
+  panel.classList.remove('open');
+  panel.setAttribute('aria-hidden', 'true');
   // Bump the token so any in-flight _loadGdpRomSection bails before mutating
   // a row that's about to be torn down.
   _gdpOpenToken++;
@@ -219,6 +247,8 @@ function closeGameDetail() {
   const inner = document.getElementById('gdp-inner');
   if (inner) inner.innerHTML = '';
   GamepadManager.resetFocus();
+  if (_gdpReturnFocus?.isConnected) _gdpReturnFocus.focus({ preventScroll: true });
+  _gdpReturnFocus = null;
 }
 
 /* ── LAUNCH SEQUENCE ── */
@@ -260,6 +290,8 @@ async function launchGame(g) {
   // Preferred over the Ruffle iframe when the server is reachable.
   // Windows  → nativeExe (.exe)       | Linux → nativeExeLinux (run.sh via bash)
   // Windows + no .exe but has Linux   → WSL launch
+  // Flash stays in the bundled Ruffle player, including desktop builds.
+  if (g.systemId === 'flash') { launchFlashGame(g); return; }
   const canNativeWin   = g.nativeExe      && serverPlatform === 'Windows';
   const canNativeLin   = g.nativeExeLinux && serverPlatform === 'Linux';
   const canWSL         = g.nativeExeLinux && serverPlatform === 'Windows' && !g.nativeExe;
@@ -316,6 +348,18 @@ async function launchGame(g) {
     } catch {
       await RomDB.remove(g.id);
     }
+  }
+
+  // Server downloads live on disk, outside the browser's IndexedDB/OPFS.
+  const serverRom = await findServerRom(g);
+  if (serverRom) {
+    ROM_STATUS[g.id] = true;
+    const startup = await launchWithEmulatorJS(g, serverRom.url, serverRom);
+    if (startup && !startup.success && !startup.cancelled) {
+      ROM_STATUS[g.id] = false;
+      launchFromCloud(g);
+    }
+    return;
   }
 
   // No local ROM — check connectivity and decide

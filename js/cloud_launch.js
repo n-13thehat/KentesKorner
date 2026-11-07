@@ -29,6 +29,7 @@ async function _collectCloudMirrors(game) {
   const seen    = new Set();
   const _push = (m) => {
     if (!m?.url || seen.has(m.url)) return;
+    if (!romTitleMatches(m.filename || _guessFilenameFromUrl(m.url), game.title)) return;
     seen.add(m.url);
     mirrors.push(m);
   };
@@ -242,6 +243,17 @@ async function launchFromCloud(game) {
     return;
   }
 
+  // With the local server available, download through DownloadManager first.
+  // Its ROM proxy writes each chunk to the server's ROMS_DIR while reporting
+  // progress, so large ISOs never need to be assembled into a renderer blob.
+  // Streaming remains available in browser-only mode as a compatibility path.
+  if (KENTE_SERVER_ONLINE) {
+    KenteAudio.click();
+    await DownloadManager.enqueue(game, { autoLaunch: true });
+    openDownloadCenter();
+    return;
+  }
+
   // Cloud ROM metadata accumulated during this launch — passed explicitly to
   // launchWithEmulatorJS and the save button instead of through a global variable.
   let _cloudRomData = null;
@@ -252,7 +264,7 @@ async function launchFromCloud(game) {
   document.getElementById('ejs-game-title').textContent   = game.title;
   document.getElementById('ejs-system-badge').textContent = game.system.toUpperCase();
   document.getElementById('ejs-loader')?.remove();
-  container.innerHTML = `
+  const loadingMarkup = `
     <div style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;
                 justify-content:center;gap:16px;color:#555;font-family:var(--font-mono);font-size:12px;
                 letter-spacing:0.2em">
@@ -261,6 +273,7 @@ async function launchFromCloud(game) {
       <div id="ejs-load-status">SEARCHING CLOUD...</div>
     </div>
     <style>@keyframes ejs-spin{to{transform:rotate(360deg)}}</style>`;
+  container.innerHTML = loadingMarkup;
   overlay.classList.add('active');
   state.screen = 'playing';
   KenteAudio.setHumVol(0);
@@ -296,6 +309,12 @@ async function launchFromCloud(game) {
     let usedMirror = null;
 
     for (let i = 0; i < mirrors.length; i++) {
+      if (i > 0) {
+        container.innerHTML = loadingMarkup;
+        overlay.classList.add('active');
+        state.screen = 'playing';
+        KenteAudio.setHumVol(0);
+      }
       const mirror    = mirrors[i];
       const provLabel = (mirror.provider || 'unknown').toUpperCase().replace(/_/g, ' ');
       const sizeMb    = mirror.size ? ` (${(mirror.size / 1_048_576).toFixed(0)} MB)` : '';
@@ -312,16 +331,26 @@ async function launchFromCloud(game) {
       // — reserve the proxy fallback for the final mirror only.
       const allowCorsProxies = KENTE_SERVER_ONLINE || (i === mirrors.length - 1);
 
+      let attemptedStartup = false;
       try {
         const out = await _streamMirror(mirror, game, statusEl, allowCorsProxies);
+        if (state.screen !== 'playing') { URL.revokeObjectURL(out.blobUrl); return; }
         blobUrl           = out.blobUrl;
         savedBatoceraPath = out.savedBatoceraPath;
         usedMirror        = mirror;
+        _cloudRomData = { url: mirror.url, filename: mirror.filename, systemId: game.systemId };
+        attemptedStartup = true;
+        const startup = await launchWithEmulatorJS(game, blobUrl, _cloudRomData);
+        if (!startup || startup.cancelled) return;
+        if (!startup.success) throw new Error(startup.error || 'EMULATOR_START_FAILED');
         RomSourceLedger.onSuccess(mirror.provider);
         if (DEBUG) console.log(`[Kente/cloud] mirror ${i + 1}/${mirrors.length} (${provLabel}) succeeded`);
         break;
       } catch (mirrorErr) {
         lastErr = mirrorErr;
+        if (attemptedStartup) exitEmulator();
+        if (blobUrl) URL.revokeObjectURL(blobUrl);
+        blobUrl = null;
         RomSourceLedger.onFail(mirror.provider);
         console.warn(`[Kente/cloud] mirror ${i + 1}/${mirrors.length} (${provLabel}) failed: ${mirrorErr.message}`);
       }
@@ -347,9 +376,7 @@ async function launchFromCloud(game) {
 
     if (statusEl()) statusEl().textContent = 'ROM READY — STARTING EMULATOR...';
 
-    // 5 — Pass the local blob URL to EmulatorJS (treated as a "cloud" URL in the UI
-    //     since it came from the cloud — save button and cloud badge stay visible).
-    await launchWithEmulatorJS(game, blobUrl, _cloudRomData);
+    // A source is successful only after its game has actually started.
 
   } catch (err) {
     // Snapshot the found ROM url — used for the "Open on Archive.org" fallback
@@ -357,7 +384,10 @@ async function launchFromCloud(game) {
 
     // Classify the error for the user-facing message
     let errLine1, errLine2, showArchiveLink = false;
-    if (err.message === 'NO_RESULTS' || err.message === 'NO_ROM_FILE') {
+    if (err.message.startsWith('PS1 DISC ERROR:')) {
+      errLine1 = 'DISC IMAGE COULD NOT BE LOADED';
+      errLine2 = escHtml(err.message.slice('PS1 DISC ERROR:'.length).trim());
+    } else if (err.message === 'NO_RESULTS' || err.message === 'NO_ROM_FILE') {
       errLine1 = 'ROM NOT FOUND';
       errLine2 = `COULD NOT FIND A FILE FOR<br><span style="color:#777">${escHtml(game.title)}</span><br>ON ARCHIVE.ORG`;
     } else if (err.message === 'DOWNLOAD_FAILED' ||
@@ -388,6 +418,9 @@ async function launchFromCloud(game) {
     // Do NOT call showRomOptions() — that breaks the immersion with a separate screen.
     const con = document.getElementById('ejs-container');
     if (con) {
+      overlay.classList.add('active');
+      state.screen = 'playing';
+      KenteAudio.setHumVol(0);
       const archiveLinkBtn = showArchiveLink
         ? `<a id="ejserr-archive" href="${escHtml(failedRomUrl)}" target="_blank" rel="noopener"
              style="display:block;background:#0a1a0a;border:1px solid #1a3a1a;color:#30d880;

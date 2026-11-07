@@ -196,6 +196,7 @@ function renderTVZones() {
     zone.className = 'tv-zone';
     zone.dataset.tv = tv.id;
     zone.setAttribute('tabindex', '0');
+    zone.setAttribute('role', 'button');
     zone.setAttribute('aria-label', tv.label);
 
     // Use saved editor position if available, otherwise fall back to hardcoded defaults
@@ -487,6 +488,21 @@ function handleKey(e) {
   // OSK has full priority — its own capture-phase listener already handled
   // navigation + close.  Defer everything else.
   if (typeof KenteOSK !== 'undefined' && KenteOSK.active()) return;
+
+  // Right Shift toggles Download Center from the room/menu, including when
+  // the Collections search field has focus.
+  if (e.code === 'ShiftRight' && !e.repeat && !e.ctrlKey && !e.metaKey && !e.altKey &&
+      (state.screen === 'room' || state.screen === 'menu')) {
+    e.preventDefault();
+    const dlOv = document.getElementById('downloads-overlay');
+    if (dlOv?.classList.contains('active')) {
+      dlOv.classList.remove('active');
+      GamepadManager.resetFocus();
+    } else {
+      openDownloadCenter();
+    }
+    return;
+  }
 
   // While a text-entry field is focused, let the browser handle arrow keys,
   // Backspace, Enter etc. so users can edit naturally without the menu

@@ -86,7 +86,7 @@ function gameCard(g, extraStyle = '', extraAttrs = '') {
         style="display:none">`;
 
   return `
-    <div class="game-card${needsNative ? ' native-only' : ''}" data-id="${g.id}" data-system="${g.systemId}" ${extraAttrs} style="${extraStyle}">
+    <div class="game-card${needsNative ? ' native-only' : ''}" role="group" tabindex="0" aria-label="${escHtml(`${g.title}, ${g.system}, ${g.year}`)}" data-id="${g.id}" data-system="${g.systemId}" ${extraAttrs} style="${extraStyle}">
       <div class="game-card-art" style="background:linear-gradient(135deg,${colors[0]},${colors[1]})">
         ${artImg}
         <div class="game-card-cover">
@@ -151,7 +151,7 @@ function contentPlay() {
     ${recentShelf}${dlShelf}${favShelf}
     <div class="section-label">GAME LIBRARY — ${games.length} TITLE${games.length!==1?'S':''} ACTIVE</div>
     <div class="filter-bar" id="play-filter-bar">${chips}
-      <input type="search" class="library-search" id="play-search"
+      <input type="search" class="library-search" id="play-search" aria-label="Search the game library"
              placeholder="SEARCH TITLES…" autocomplete="off" spellcheck="false">
     </div>
     <div class="game-grid" id="play-grid">${games.map(g => gameCard(g, '',
@@ -210,11 +210,77 @@ function contentCollections() {
     ${dlShelf}
     <div class="section-label">COLLECTIONS — ${games.length} TITLE${games.length!==1?'S':''} · ${cols.length} COLLECTION${cols.length!==1?'S':''}</div>
     <div class="filter-bar" id="col-filter-bar">${chips}
-      <input type="search" class="library-search" id="col-search"
+      <input type="search" class="library-search" id="col-search" aria-label="Search collections"
              placeholder="SEARCH TITLES…" autocomplete="off" spellcheck="false">
     </div>
     <div id="col-info-strip" class="col-info-strip" hidden></div>
-    <div class="game-grid" id="col-grid">${cards}</div>`;
+    <div class="game-grid" id="col-grid">${cards}</div>
+    <section id="col-provider-results" class="col-provider-results" hidden aria-live="polite"></section>`;
+}
+
+let _colProviderSearchTimer = null;
+let _colProviderSearchSeq = 0;
+let _colProviderResults = [];
+
+/* Search the same collection query against providers for matching library
+   titles. Keep provider hits separate from catalog cards so they can be
+   queued directly without changing the collection filter. */
+function searchCollectionProviders(value) {
+  clearTimeout(_colProviderSearchTimer);
+  const panel = document.getElementById('col-provider-results');
+  const query = String(value || '').trim();
+  const seq = ++_colProviderSearchSeq;
+  _colProviderResults = [];
+  if (!panel) return;
+  if (query.length < 2) { panel.hidden = true; panel.innerHTML = ''; return; }
+  panel.hidden = false;
+  if (!KENTE_SERVER_ONLINE) {
+    panel.innerHTML = '<div class="section-label">DOWNLOAD SOURCES UNAVAILABLE — START KENTE SERVER</div>';
+    return;
+  }
+  const games = getActiveGames().filter(g => g.systemId !== 'flash' && g.systemId !== 'native' &&
+    g.title.toLowerCase().includes(query.toLowerCase()));
+  if (!games.length) {
+    panel.innerHTML = '<div class="section-label">NO CATALOG TITLES MATCH THIS SEARCH FOR PROVIDER DOWNLOADS</div>';
+    return;
+  }
+  panel.innerHTML = '<div class="section-label">SEARCHING DOWNLOAD PROVIDERS…</div>';
+  _colProviderSearchTimer = setTimeout(async () => {
+    if (seq !== _colProviderSearchSeq || document.getElementById('col-search')?.value.trim() !== query) return;
+    const bySystem = new Map();
+    games.forEach(g => { if (!bySystem.has(g.systemId)) bySystem.set(g.systemId, []); bySystem.get(g.systemId).push(g); });
+    const batches = await Promise.all([...bySystem.entries()].map(async ([systemId, systemGames]) => {
+      const candidates = await fetchRomSources(systemId, query);
+      return candidates.flatMap(candidate => {
+        const game = systemGames.find(g => romTitleMatches(candidate.filename || '', g.title));
+        return game ? [{ systemId, candidate, game }] : [];
+      });
+    }));
+    if (seq !== _colProviderSearchSeq || document.getElementById('col-search')?.value.trim() !== query ||
+        !document.getElementById('col-provider-results')) return;
+    const seen = new Set();
+    _colProviderResults = batches.flat().filter(({systemId, candidate}) => {
+      const key = `${systemId}|${candidate.provider}|${candidate.filename}|${candidate.url}`;
+      if (seen.has(key)) return false;
+      seen.add(key); return !!candidate.url && !!candidate.filename;
+    }).slice(0, 30);
+    if (!_colProviderResults.length) {
+      panel.innerHTML = '<div class="section-label">NO DOWNLOAD SOURCES FOUND FOR THESE TITLES</div>';
+      return;
+    }
+    panel.innerHTML = `<div class="section-label">PROVIDER DOWNLOADS — ${_colProviderResults.length} SOURCE${_colProviderResults.length === 1 ? '' : 'S'}</div>` +
+      _colProviderResults.map((hit, index) => {
+        const sys = SYSTEMS.find(s => s.id === hit.systemId);
+        return `<div class="cloud-file-row col-provider-row"><span class="cloud-file-name" title="${escHtml(hit.candidate.filename)}">${escHtml(hit.game.title)} · ${escHtml(sys?.name || hit.systemId)} · ${escHtml(hit.candidate.provider || 'PROVIDER')} · ${escHtml(hit.candidate.filename)}</span><button class="cloud-dl-btn" data-col-provider-index="${index}">DOWNLOAD</button></div>`;
+      }).join('');
+  }, 350);
+}
+
+function queueCollectionProviderResult(index) {
+  const hit = _colProviderResults[Number(index)];
+  if (!hit) return;
+  DownloadManager.enqueue(hit.game, { url: hit.candidate.url, filename: hit.candidate.filename });
+  openDownloadCenter();
 }
 
 /* ── SOURCES MENU ── */
@@ -268,6 +334,28 @@ function contentSources() {
     : '';
 
   return `
+    <section class="source-game-search" aria-labelledby="source-game-search-title">
+      <div class="source-search-heading">
+        <div>
+          <div class="section-label" id="source-game-search-title">SEARCH ALL GAME PROVIDERS</div>
+          <p>Find a title across every connected download source. Choose a console or search consoles that match your catalog.</p>
+        </div>
+        <span class="source-search-badge">IN APP DOWNLOADS</span>
+      </div>
+      <div class="source-game-search-controls">
+        <input type="search" id="source-game-search-input" placeholder="GAME TITLE…" autocomplete="off" spellcheck="false">
+        <select id="source-game-search-system" aria-label="Console">
+          <option value="all">ALL MATCHING CONSOLES</option>
+          ${SYSTEMS.filter(s => s.active && !s.sacrificed).map(s => `<option value="${escHtml(s.id)}">${escHtml(s.name)}</option>`).join('')}
+        </select>
+        <button type="button" id="source-game-search-button">SEARCH SOURCES</button>
+      </div>
+      <div class="source-game-search-hint">DOWNLOADS OPEN IN DOWNLOAD CENTER AND SAVE TO THE MATCHING CONSOLE'S ROM FOLDER. USE A CONSOLE FILTER FOR TITLES OUTSIDE THE CATALOG.</div>
+      <div id="source-game-search-results" class="source-game-search-results" aria-live="polite">
+        <div class="source-search-empty">Enter a game title to search provider sources.</div>
+      </div>
+    </section>
+
     <div class="section-label">CONNECTED SOURCES — ${totalSystems} SYSTEM${totalSystems!==1?'S':''} · ${totalGames} TITLES</div>
     <div class="source-grid">${builtinCard}${romLibCard}</div>
     ${liveSection}
@@ -322,9 +410,129 @@ function contentSources() {
     <div class="source-grid">
       <div class="source-card" data-action="addSource" style="border-style:dashed;display:flex;align-items:center;justify-content:center;gap:10px;aspect-ratio:unset;padding:24px;cursor:pointer">
         <span style="font-size:20px;opacity:0.4">＋</span>
-        <span style="font-family:var(--font-mono);font-size:11px;color:var(--text-dim);letter-spacing:0.15em">ADD NEW SOURCE</span>
+        <span style="font-family:var(--font-mono);font-size:11px;color:var(--text-dim);letter-spacing:0.15em">CHOOSE ROMS / ISOS FOLDER</span>
       </div>
     </div>`;
+}
+
+let _sourceGameSearchSeq = 0;
+let _sourceGameSearchResults = [];
+
+function _sourceGameSize(bytes) {
+  const size = Number(bytes);
+  if (!Number.isFinite(size) || size <= 0) return 'SIZE UNKNOWN';
+  return size < 500 * 1024 * 1024
+    ? `${(size / (1024 * 1024)).toFixed(1)} MB`
+    : `${(size / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function _sourceProviderName(id) {
+  const names = {
+    archive: 'INTERNET ARCHIVE', archive_packs: 'ARCHIVE PACKS',
+    archive_redump: 'REDUMP', archive_tosec: 'TOSEC', vimm: "VIMM'S LAIR",
+    cdromance: 'CDROMANCE', hshop: 'HSHOP', coolrom: 'COOLROM',
+    myrient: 'MYRIENT', emuparadise: 'EMUPARADISE',
+  };
+  return names[id] || String(id || 'PROVIDER').replace(/[_-]+/g, ' ').toUpperCase();
+}
+
+async function searchAllGameProviders() {
+  const input = document.getElementById('source-game-search-input');
+  const systemSelect = document.getElementById('source-game-search-system');
+  const resultsEl = document.getElementById('source-game-search-results');
+  if (!input || !systemSelect || !resultsEl) return;
+  const query = input.value.trim();
+  const selectedSystem = systemSelect.value;
+  const seq = ++_sourceGameSearchSeq;
+  _sourceGameSearchResults = [];
+  if (query.length < 2) {
+    resultsEl.innerHTML = '<div class="source-search-empty">Enter at least two letters of a game title.</div>';
+    return;
+  }
+  if (!KENTE_SERVER_ONLINE) {
+    resultsEl.innerHTML = '<div class="source-search-empty">START KENTE SERVER TO SEARCH AND DOWNLOAD PROVIDER FILES.</div>';
+    return;
+  }
+
+  let systemIds;
+  if (selectedSystem !== 'all') systemIds = [selectedSystem];
+  else {
+    const q = query.toLocaleLowerCase();
+    const matchingGames = getActiveGames().filter(g => g.systemId !== 'flash' && g.systemId !== 'native' &&
+      String(g.title || '').toLocaleLowerCase().includes(q));
+    systemIds = [...new Set(matchingGames.map(g => g.systemId))];
+    if (!systemIds.length) {
+      resultsEl.innerHTML = '<div class="source-search-empty">Choose a console to search all providers for titles outside the built in catalog.</div>';
+      return;
+    }
+  }
+
+  resultsEl.innerHTML = `<div class="source-search-empty">SEARCHING ALL PROVIDERS FOR “${escHtml(query)}”…</div>`;
+  const groups = await Promise.all(systemIds.map(async systemId => ({
+    systemId, candidates: await fetchRomSources(systemId, query),
+  })));
+  if (seq !== _sourceGameSearchSeq || document.getElementById('source-game-search-input')?.value.trim() !== query ||
+      document.getElementById('source-game-search-system')?.value !== selectedSystem) return;
+
+  const library = getActiveGames();
+  const seen = new Set();
+  _sourceGameSearchResults = groups.flatMap(({ systemId, candidates }) => candidates.map(candidate => ({
+    systemId, candidate,
+    game: library.find(g => g.systemId === systemId && romTitleMatches(candidate.filename || '', g.title)) || null,
+  }))).filter(hit => {
+    const key = `${hit.systemId}|${hit.candidate.provider}|${hit.candidate.filename}|${hit.candidate.url}`;
+    if (seen.has(key) || !hit.candidate.url || !hit.candidate.filename) return false;
+    seen.add(key);
+    return true;
+  }).slice(0, 60);
+
+  if (!_sourceGameSearchResults.length) {
+    resultsEl.innerHTML = '<div class="source-search-empty">NO PROVIDER MATCHES FOUND. TRY ANOTHER TITLE OR CONSOLE.</div>';
+    return;
+  }
+  resultsEl.innerHTML = _sourceGameSearchResults.map((hit, index) => {
+    const system = SYSTEMS.find(s => s.id === hit.systemId);
+    const title = hit.game?.title || hit.candidate.title ||
+      String(hit.candidate.filename).replace(/\.[^.]+$/, '').replace(/\s*\([^)]*\)/g, '').replace(/[_-]+/g, ' ').trim();
+    const year = hit.candidate.year || hit.game?.year || String(hit.candidate.filename).match(/\b(?:19|20)\d{2}\b/)?.[0] || 'YEAR UNKNOWN';
+    const provider = _sourceProviderName(hit.candidate.provider);
+    return `<article class="source-game-result">
+      <div class="source-game-result-main">
+        <div class="source-game-result-title">${escHtml(title)}</div>
+        <div class="source-game-result-file">${escHtml(hit.candidate.filename)}</div>
+      </div>
+      <div class="source-game-result-meta">
+        <span><small>CONSOLE</small>${escHtml(system?.name || hit.systemId)}</span>
+        <span><small>PROVIDER</small>${escHtml(provider)}</span>
+        <span><small>YEAR</small>${escHtml(String(year))}</span>
+        <span><small>SIZE</small>${escHtml(_sourceGameSize(hit.candidate.size))}</span>
+      </div>
+      <button class="source-game-download" data-source-game-index="${index}" type="button">⬇ DOWNLOAD</button>
+    </article>`;
+  }).join('');
+  resultsEl.querySelectorAll('[data-source-game-index]').forEach(button => {
+    button.addEventListener('click', () => queueSourceGameDownload(button.dataset.sourceGameIndex));
+  });
+}
+
+function queueSourceGameDownload(index) {
+  const hit = _sourceGameSearchResults[Number(index)];
+  if (!hit) return;
+  const candidate = hit.candidate;
+  const system = SYSTEMS.find(s => s.id === hit.systemId);
+  const title = hit.game?.title || candidate.title ||
+    String(candidate.filename).replace(/\.[^.]+$/, '').replace(/\s*\([^)]*\)/g, '').replace(/[_-]+/g, ' ').trim();
+  const safeId = String(candidate.filename).toLowerCase().replace(/[^a-z0-9]+/g, '_').slice(0, 64);
+  const game = hit.game || {
+    id: `provider_${hit.systemId}_${safeId}`,
+    title, system: system?.name || hit.systemId.toUpperCase(), systemId: hit.systemId,
+    tier: system?.tier || 1, img: null,
+  };
+  DownloadManager.enqueue(game, {
+    url: candidate.url, filename: candidate.filename,
+    sourceName: candidate.provider || 'provider',
+  });
+  openDownloadCenter();
 }
 
 async function hydrateSourcesMenu() {

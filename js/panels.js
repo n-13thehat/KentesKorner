@@ -512,13 +512,19 @@ async function launchFromDownloadCenter(dlid) {
 
   const game = findGameForDownload(item.game.systemId, item.filename) || item.game;
 
-  if (serverIsBatocera) {
-    // On Batocera the file is in /userdata/roms/ — native launch works immediately
+  if (serverIsBatocera || (KENTE_SERVER_ONLINE && NativePlayer.supported())) {
+    // Server downloads are saved under its configured ROMS_DIR
+    // (/userdata/roms on Batocera, or the app's local data/roms folder).
     launchNative(game, true);
     return;
   }
 
   if (CORE_MAP[game.systemId]) {
+    if (!romTitleMatches(item.filename || '', game.title)) {
+      showToast('⚠ DOWNLOADED FILE DOES NOT MATCH THIS GAME — SEARCHING AGAIN');
+      launchFromCloud(game);
+      return;
+    }
     // Browser-playable system — try RomDB handle, then OPFS, then stream from archive
     const handle = await RomDB.get(game.id).catch(() => null);
     if (handle) { launchWithEmulatorJS(game, handle); return; }
@@ -536,9 +542,19 @@ async function launchFromDownloadCenter(dlid) {
       } catch { /* fall through to archive stream */ }
     }
 
+    const serverRom = await findServerRom(game, item.filename);
+    if (serverRom) {
+      const startup = await launchWithEmulatorJS(game, serverRom.url, serverRom);
+      if (startup && !startup.success && !startup.cancelled) launchFromCloud(game);
+      return;
+    }
+
     if (item.archiveUrl) {
       showToast('📡 STREAMING FROM ARCHIVE.ORG...');
-      launchWithEmulatorJS(game, item.archiveUrl,
+      const url = KENTE_SERVER_ONLINE
+        ? `${KENTE_SERVER_URL}/api/rom-proxy?${new URLSearchParams({ url: item.archiveUrl })}`
+        : item.archiveUrl;
+      launchWithEmulatorJS(game, url,
         { url: item.archiveUrl, filename: item.filename, systemId: game.systemId });
       return;
     }

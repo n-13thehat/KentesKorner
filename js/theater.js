@@ -61,19 +61,21 @@ function contentTheater() {
       <button class="filter-chip"        data-theater-tab="shows">SHOWS</button>
       <div class="theater-search">
         <span class="theater-search-icon">⌕</span>
-        <input type="search" id="theater-search-input" placeholder="SEARCH TITLES…" autocomplete="off">
+        <input type="search" id="theater-search-input" aria-label="Search movies and shows" placeholder="SEARCH TITLES…" autocomplete="off">
       </div>
     </div>
-    <div id="theater-rows">${rows}</div>`;
+    <div id="theater-rows" role="region" aria-label="Movies and shows">${rows}</div>`;
 }
 
 /* ── Theater state + helpers ── */
 const TheaterState = {
   rowItems: {},     // rowId -> [items]
+  rowGeneration: {},
   hero:     [],     // up to 5 hero items
   heroIdx:  0,
   heroTimer: null,
   searchTimer: null,
+  searchGeneration: 0,
   activeTab: 'movies',
   currentItem: null,    // last item opened in the detail overlay (used by player)
 };
@@ -240,7 +242,7 @@ function _tvpSetHeaderMeta(parts) {
 }
 
 function _theaterPosterCard(it, provider) {
-  const poster  = it.poster ? escHtml(it.poster) : '';
+  const poster  = it.poster ? escHtml(safeMediaUrl(it.poster)) : '';
   const title   = escHtml(it.title || '');
   const year    = it.year   ? escHtml(String(it.year))    : '';
   const quality = it.quality ? escHtml(it.quality)        : '';
@@ -258,7 +260,7 @@ function _theaterPosterCard(it, provider) {
     : '';
   const prov = it.provider || provider || 'lookmovie';
   const kind = it.kind || it.type || 'movie';
-  return `<div class="theater-poster" tabindex="0"
+  return `<div class="theater-poster" role="button" tabindex="0" aria-label="Open details for ${title}"
               data-provider="${escHtml(prov)}"
               data-kind="${escHtml(kind)}"
               data-slug="${escHtml(it.slug || it.id || '')}"
@@ -272,6 +274,8 @@ function _theaterPosterCard(it, provider) {
 }
 
 async function hydrateTheaterMenu() {
+  // Invalidate results still resolving from a previous visit to the Theater.
+  TheaterState.searchGeneration++;
   if (!KENTE_SERVER_ONLINE) {
     const wrap = document.getElementById('theater-rows');
     if (wrap) wrap.innerHTML =
@@ -309,12 +313,13 @@ async function hydrateTheaterMenu() {
   }
 
   const input = document.getElementById('theater-search-input');
-  if (input && !hydrateTheaterMenu._searchBound) {
-    hydrateTheaterMenu._searchBound = true;
+  if (input && !input._theaterSearchBound) {
+    input._theaterSearchBound = true;
     input.addEventListener('input', e => {
       clearTimeout(TheaterState.searchTimer);
       const q = e.target.value.trim();
-      TheaterState.searchTimer = setTimeout(() => _theaterRunSearch(q), 320);
+      const generation = ++TheaterState.searchGeneration;
+      TheaterState.searchTimer = setTimeout(() => _theaterRunSearch(q, generation), 320);
     });
     // Open the themed virtual keyboard whenever the search box is engaged.
     // While open, KenteOSK gates global keyboard / gamepad menu nav so arrow
@@ -334,9 +339,12 @@ async function hydrateTheaterMenu() {
 async function _theaterLoadRow(cfg) {
   const el = document.getElementById('theater-row-' + cfg.id);
   if (!el) return;
+  const generation = (TheaterState.rowGeneration[cfg.id] || 0) + 1;
+  TheaterState.rowGeneration[cfg.id] = generation;
+  const current = () => TheaterState.rowGeneration[cfg.id] === generation;
   // Local rows (My List / Continue Watching) read from IndexedDB and
   // hide their containing .theater-row when the store is empty.
-  if (cfg.local) return _theaterLoadLocalRow(cfg, el);
+  if (cfg.local) return _theaterLoadLocalRow(cfg, el, current);
   try {
     let data;
     if (cfg.curated) {
@@ -350,17 +358,21 @@ async function _theaterLoadRow(cfg) {
       if (cfg.genre) qs.genre = cfg.genre;
       data = await _theaterFetch('/api/theater/browse', qs);
     }
+    if (!current()) return;
     const items = (data && data.items) || [];
     TheaterState.rowItems[cfg.id] = items;
     if (!items.length) { el.innerHTML = '<div class="theater-empty">— EMPTY —</div>'; return; }
     el.innerHTML = items.map(it => _theaterPosterCard(it, cfg.provider)).join('');
   } catch (e) {
+    if (!current()) return;
     console.warn('[Kente/theater] row load failed:', cfg.id, e);
-    el.innerHTML = `<div class="theater-error">⚠ ${escHtml(cfg.title)} UNAVAILABLE</div>`;
+    renderInlineStatus(el, `${cfg.title} UNAVAILABLE`, {
+      kind: 'error', className: 'theater-error', retry: () => _theaterLoadRow(cfg),
+    });
   }
 }
 
-async function _theaterLoadLocalRow(cfg, el) {
+async function _theaterLoadLocalRow(cfg, el, current = () => true) {
   const rowEl = el.closest('.theater-row');
   let items = [];
   try {
@@ -377,6 +389,7 @@ async function _theaterLoadLocalRow(cfg, el) {
   } catch (e) {
     console.warn('[Kente/theater] local row failed:', cfg.id, e);
   }
+  if (!current()) return;
   TheaterState.rowItems[cfg.id] = items;
   if (!items.length) {
     // Hide the entire row container when the store is empty —
@@ -405,7 +418,8 @@ async function _theaterRefreshLocalRows() {
     }));
 }
 
-async function _theaterRunSearch(query) {
+async function _theaterRunSearch(query, generation = ++TheaterState.searchGeneration) {
+  if (generation !== TheaterState.searchGeneration) return;
   const wrap = document.getElementById('theater-rows');
   if (!wrap) return;
   if (!query) {
@@ -443,6 +457,7 @@ async function _theaterRunSearch(query) {
   const SEARCH_PROVIDERS = ['miruro', 'vidsrc', '2embed', 'vidsrcpm', 'multiembed', 'youtube', 'lookmovie', 'baddies'];
   const results = await Promise.allSettled(SEARCH_PROVIDERS.map(p =>
     _theaterFetch('/api/theater/search', { provider: p, ...opts })));
+  if (generation !== TheaterState.searchGeneration) return;
   const merged = [];
   const seen = new Set();
   results.forEach((r, idx) => {
@@ -459,9 +474,10 @@ async function _theaterRunSearch(query) {
   if (!el) return;
   if (!merged.length) {
     const allFailed = results.every(r => r.status === 'rejected');
-    el.innerHTML = allFailed
-      ? '<div class="theater-error">⚠ SEARCH FAILED</div>'
-      : '<div class="theater-empty">NO MATCHES</div>';
+    if (allFailed) renderInlineStatus(el, 'SEARCH FAILED', {
+      kind: 'error', className: 'theater-error', retry: () => _theaterRunSearch(query),
+    });
+    else renderInlineStatus(el, 'NO MATCHES', { className: 'theater-empty' });
     return;
   }
   el.innerHTML = merged.map(it => _theaterPosterCard(it, it.provider)).join('');
@@ -481,7 +497,8 @@ function _theaterBuildHero() {
   pool.forEach((it, i) => {
     const s = document.createElement('div');
     s.className = 'theater-hero-slide' + (i === 0 ? ' active' : '');
-    if (it.backdrop || it.poster) s.style.backgroundImage = `url("${it.backdrop || it.poster}")`;
+    const imageUrl = safeMediaUrl(it.backdrop || it.poster);
+    if (imageUrl) s.style.backgroundImage = `url("${imageUrl}")`;
     hero.insertBefore(s, hero.firstChild);
   });
   const dotsEl = hero.querySelector('.theater-hero-dots');

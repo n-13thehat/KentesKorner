@@ -173,10 +173,15 @@ function defineUpstreamCompression(ctx) {
 function defineUpstreamEmulator(ctx) {
   vm.runInContext(`
     class EmulatorJS {
-      constructor() { this.errors = []; }
+      constructor() {
+        this.errors = [];
+        this.storage = { core: { get(_k) { return Promise.resolve(null); } } };
+      }
+      downloadGameCore() { return this.storage.core.get('nestopia-legacy-wasm.data'); }
       createElement(t) { return document.createElement(t); }
       startGameError(m) { this.errors.push(m); }
       initModule() { this.moduleInited = true; }
+      startGame() { this.calledStartGame = true; }
       getCore() { return 'nestopia'; }
       downloadFile(_p) { return Promise.resolve({ data: new Uint8Array() }); }
       initGameCore(js, wasm, worker) {
@@ -205,6 +210,9 @@ test('EmulatorJS setter trap installs and hooks downloadFile + initGameCore', ()
   const inst = vm.runInContext('new EmulatorJS()', ctx);
   inst.downloadFile('cores/nestopia-wasm.data');
   assert.equal(inst._kenteLastCoreName, 'nestopia-wasm.data');
+  inst.downloadGameCore();
+  assert.equal(inst._kenteLastCoreName, 'nestopia-legacy-wasm.data',
+    'core name should be recorded from the IndexedDB cache lookup');
 });
 
 // Probe the live server once; skip the integration test below when nothing
@@ -269,4 +277,41 @@ test('initGameCore recovers from stash when given empty args', () => {
   assert.equal(created.length, 1, 'should create exactly one <script>');
   assert.ok(created[0].src && created[0].src.startsWith('blob:'),
     'should set blob: src on script');
+});
+
+test('empty ROM archives never substitute the cached emulator core as game content', async () => {
+  const { ctx, win } = makeSandbox({ workerEmitsFiles: false });
+  let fallbackFetches = 0;
+  win.fetch = async () => { fallbackFetches++; throw new Error('unexpected core fallback'); };
+  loadPatches(ctx);
+  defineUpstreamCompression(ctx);
+  defineUpstreamEmulator(ctx);
+  const ejs = vm.runInContext('new EmulatorJS()', ctx);
+  ejs.downloadFile('cores/nestopia-wasm.data');
+  const comp = vm.runInContext('(ejs) => new window.EJS_COMPRESSION(ejs)', ctx)(ejs);
+  const written = [];
+  const head = new Uint8Array([0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C, 0, 0, 0, 0]);
+  await comp.decompress(head, () => {}, (...args) => written.push(args));
+  assert.equal(fallbackFetches, 0);
+  assert.equal(written.length, 0);
+  assert.match(ejs.errors[0], /Unable to extract this archive/);
+});
+
+test('PS1 missing or encoded disc tracks stop before startGame and report startup failure', () => {
+  const { ctx, win } = makeSandbox({ workerEmitsFiles: false });
+  vm.runInContext(fs.readFileSync(path.join(ROOT, 'js/rom_tools.js'), 'utf8'), ctx);
+  const reported = [];
+  win.EJS_onGameError = message => reported.push(message);
+  loadPatches(ctx);
+  defineUpstreamEmulator(ctx);
+  const ejs = vm.runInContext('new EmulatorJS()', ctx);
+  ejs.getCore = () => 'pcsx_rearmed';
+  ejs.fileName = 'game.cue';
+  ejs.gameManager = { FS: {
+    analyzePath: name => ({ exists: ['/game.cue', '/game.bin.ecm'].includes(name) }),
+    readFile: () => 'FILE "game.bin" BINARY\n',
+  } };
+  ejs.startGame();
+  assert.equal(ejs.calledStartGame, undefined);
+  assert.match(reported[0], /ECM/);
 });

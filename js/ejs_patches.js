@@ -37,20 +37,26 @@
     C.prototype.decompressFile = function(method, data, updateMsg, fileCbFunc) {
       return new Promise(async (resolve) => {
         let settled = false;
-        const done = (v) => { if (settled) return; settled = true; resolve(v); };
+        let worker = null, watchdog = null, workerUrl = null;
+        const done = (v) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(watchdog);
+          try { worker?.terminate(); } catch {}
+          if (workerUrl) URL.revokeObjectURL(workerUrl);
+          resolve(v);
+        };
         const fail = (reason, detail) => {
           console.error('[EJS-patch]', method, 'decompress failed:', reason, detail || '');
-          try {
-            this.EJS && this.EJS.startGameError &&
-              this.EJS.startGameError('Decompress failed: ' + reason + ' — see DevTools console');
-          } catch {}
+          // Let decompress() attempt core recovery before declaring failure.
           done({});
         };
         try {
           const file   = await this.getWorkerFile(method);
-          const worker = new Worker(URL.createObjectURL(file));
+          workerUrl = URL.createObjectURL(file);
+          worker = new Worker(workerUrl);
           const files  = {};
-          const watchdog = setTimeout(() => {
+          watchdog = setTimeout(() => {
             try { worker.terminate(); } catch {}
             fail('timeout after ' + (TIMEOUT_MS / 1000) + 's',
                  { method, byteLength: data && data.byteLength });
@@ -130,7 +136,8 @@
         // zero files for some archives (likely an emscripten/p7zip bug); when
         // that happens, fetch the pre-extracted contents from kente-server's
         // /api/ejs/extract-core endpoint and synthesize the result dict.
-        if (empty && is7z && this.EJS && this.EJS._kenteLastCoreName) {
+        if (empty && (is7z || isZip) && typeof fileCbFunc !== 'function'
+            && this.EJS && this.EJS._kenteLoadingCore !== false && this.EJS._kenteLastCoreName) {
           const name = this.EJS._kenteLastCoreName;
           try {
             console.warn('[EJS-patch] worker returned 0 files for', name,
@@ -156,6 +163,9 @@
           } catch (e) {
             console.error('[EJS-patch] server fallback failed for', name, ':', e);
           }
+        }
+        if ((is7z || isZip) && (!files || !Object.keys(files).length)) {
+          try { this.EJS?.startGameError('Unable to extract this archive. Try another source or an extracted ROM.'); } catch {}
         }
         try { if (this.EJS) this.EJS._kenteLastDecompressed = files; } catch {}
         return files;
@@ -195,6 +205,25 @@
     if (!C || C._kentePatched) return C;
     const orig = C.prototype.initGameCore;
     if (typeof orig !== 'function') return C;
+    const origStartGameError = C.prototype.startGameError;
+    if (typeof origStartGameError === 'function') {
+      C.prototype.startGameError = function(message) {
+        try { return origStartGameError.call(this, message); }
+        finally {
+          if (typeof window.EJS_onGameError === 'function') window.EJS_onGameError(String(message), this);
+        }
+      };
+    }
+    const origStartGame = C.prototype.startGame;
+    if (typeof origStartGame === 'function') {
+      C.prototype.startGame = function(...args) {
+        if (this.getCore() === 'pcsx_rearmed' && typeof validatePs1Content === 'function') {
+          const error = validatePs1Content(this.gameManager.FS, this.fileName);
+          if (error) { this.startGameError(error); return; }
+        }
+        return origStartGame.apply(this, args);
+      };
+    }
     // Hook downloadFile so we can remember the active core archive name. The
     // compression-side server fallback uses this when the browser's WASM 7z
     // worker silently emits zero files, fetching the pre-extracted contents
@@ -203,14 +232,39 @@
     if (typeof origDownloadFile === 'function') {
       C.prototype.downloadFile = function(p, ...rest) {
         try {
-          if (typeof p === 'string' && p.startsWith('cores/') && p.endsWith('.data')) {
-            this._kenteLastCoreName = p.slice('cores/'.length);
+          if (typeof p === 'string' && p.endsWith('-wasm.data') &&
+              (p.startsWith('cores/') || p.includes('/cores/'))) {
+            this._kenteLastCoreName = p.slice(p.lastIndexOf('/') + 1);
           }
         } catch {}
         return origDownloadFile.call(this, p, ...rest);
       };
     }
+    // Cached cores come from storage.core.get(filename) and skip downloadFile
+    // entirely, so also record the core name from the cache lookup.
+    const origDownloadGameCore = C.prototype.downloadGameCore;
+    if (typeof origDownloadGameCore === 'function') {
+      C.prototype.downloadGameCore = function(...args) {
+        this._kenteLoadingCore = true;
+        try {
+          const st = this.storage && this.storage.core;
+          if (st && typeof st.get === 'function' && !st._kenteHooked) {
+            const origGet = st.get;
+            const ejs = this;
+            st.get = function(key, ...rest) {
+              try {
+                if (typeof key === 'string' && key.endsWith('-wasm.data')) ejs._kenteLastCoreName = key;
+              } catch {}
+              return origGet.call(this, key, ...rest);
+            };
+            st._kenteHooked = true;
+          }
+        } catch {}
+        return origDownloadGameCore.apply(this, args);
+      };
+    }
     C.prototype.initGameCore = function(jsBytes, wasmBytes, workerBytes) {
+      this._kenteLoadingCore = false;
       let js = jsBytes, wasm = wasmBytes, worker = workerBytes;
       // Recovery: if upstream's filename matcher missed any of the three core
       // files, scan the stashed decompression result for a key with the right

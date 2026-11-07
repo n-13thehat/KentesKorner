@@ -10,11 +10,15 @@
  *  5. Kill the server process on quit — no orphan processes left behind
  */
 
-const { app, BrowserWindow, ipcMain, shell, dialog } = require('electron');
-const { spawn } = require('child_process');
+const { app, BrowserWindow, ipcMain, shell, dialog, desktopCapturer } = require('electron');
+const { spawn, execFileSync } = require('child_process');
 const path  = require('path');
 const fs    = require('fs');
 const http  = require('http');
+
+// Prefer the discrete GPU on hybrid-graphics Windows laptops for the shell
+// and EmulatorJS WebGL renderer.
+app.commandLine.appendSwitch('force-high-performance-gpu');
 
 const SERVER_PORT    = 7777;
 const SERVER_TIMEOUT = 30_000;   // ms to wait for server to boot
@@ -90,7 +94,7 @@ function resolveServer() {
     const py = path.join(__dirname, '..', 'batocera', 'kente-server.py');
     return { cmd: 'python', args: [py] };
   }
-  const exe = resourcePath('kente-server.exe');
+  const exe = resourcePath(process.platform === 'win32' ? 'kente-server.exe' : 'kente-server');
   if (fs.existsSync(exe)) return { cmd: exe, args: [] };
   // Dev fallback — requires Python 3 in PATH
   const py = path.join(__dirname, '..', 'batocera', 'kente-server.py');
@@ -109,10 +113,13 @@ function startServer() {
   const env = {
     ...process.env,
     KENTE_APP_MODE:     'electron',
+    KENTE_HOST_PID:     String(process.pid),
     KENTE_DATA_DIR:     path.join(app.getPath('userData'), 'KenteCorner'),
+    KENTE_RUNTIME_DIR:  resourcePath('emulators'),
+    KENTE_RUNTIME_DLL_DIR: resourcePath('runtime-dlls'),
     TEMP:               pyiTmp,
     TMP:                pyiTmp,
-    KENTE_DOLPHIN_PATH: resourcePath('dolphin', 'Dolphin.exe'),
+    KENTE_DOLPHIN_PATH: resourcePath('emulators', 'dolphin', 'Dolphin.exe'),
     // Web assets live outside the asar so the bundled python server can
     // read them.  In dev (unpackaged) we point at the repo root.
     KENTE_WEB_DIR:      app.isPackaged
@@ -130,8 +137,19 @@ function startServer() {
 
 function killServer() {
   if (!serverProcess) return;
-  try { serverProcess.kill(); } catch (_) {}
+  const proc = serverProcess;
   serverProcess = null;
+  if (!proc.pid || proc.exitCode !== null || proc.signalCode !== null) return;
+  // A PyInstaller onefile server has a bootloader parent and a Python child.
+  // Killing only the parent on Windows leaves the HTTP server on port 7777.
+  if (process.platform === 'win32') {
+    try {
+      execFileSync('taskkill', ['/PID', String(proc.pid), '/T', '/F'],
+        { windowsHide: true, stdio: 'ignore', timeout: 5000 });
+      return;
+    } catch (_) { /* fall back if the process already exited or taskkill failed */ }
+  }
+  try { proc.kill(); } catch (_) {}
 }
 
 /** Poll /api/ping until the server responds 200 or the timeout elapses. */
@@ -157,7 +175,9 @@ function waitForServer() {
 // ── Window ───────────────────────────────────────────────────────────────────
 
 function createWindow() {
+  console.log('[kente] Creating main window');
   mainWindow = new BrowserWindow({
+    title:           "Kente's Korner",
     width:           1280,
     height:          800,
     show:            false,   // shown after ready-to-show to avoid blank flash
@@ -167,17 +187,33 @@ function createWindow() {
       preload:          path.join(__dirname, 'preload.js'),
       nodeIntegration:  false,
       contextIsolation: true,
+      backgroundThrottling: false,
       // Allow EmulatorJS / Archive.org cross-origin fetches
       webSecurity:      true,
     },
   });
 
-  mainWindow.once('ready-to-show', () => {
+  let _shown = false;
+  const showMainWindow = () => {
+    if (_shown || !mainWindow || mainWindow.isDestroyed()) return;
+    _shown = true;
+    console.log('[kente] Showing main window');
     mainWindow.maximize();
     mainWindow.show();
+    mainWindow.focus();
+  };
+  mainWindow.once('ready-to-show', showMainWindow);
+  mainWindow.webContents.once('did-fail-load', (_event, code, description, url) => {
+    console.error(`[kente] Page load failed (${code}): ${description} — ${url}`);
   });
+  // Do not leave the app running invisibly if Chromium fails to emit
+  // ready-to-show (for example, while recovering from a broken GPU process).
+  mainWindow.webContents.once('did-finish-load', showMainWindow);
+  setTimeout(showMainWindow, 5000);
 
-  mainWindow.loadURL(`http://localhost:${SERVER_PORT}`);
+  mainWindow.loadURL(`http://localhost:${SERVER_PORT}`).catch(err => {
+    console.error('[kente] Could not load app page:', err.message);
+  });
 
   // F11 fullscreen toggle (works even when focus is inside an iframe).
   mainWindow.webContents.on('before-input-event', (event, input) => {
@@ -218,10 +254,10 @@ function createWindow() {
   // iframe ad doing `top.location = adUrl` would otherwise navigate the
   // whole app away from the loaded http://localhost server URL.
   mainWindow.webContents.on('will-navigate', (event, url) => {
-    if (!_theaterActive) return;
     try {
       const u = new URL(url);
-      if (u.hostname === 'localhost' || u.hostname === '127.0.0.1') return;
+      if ((u.hostname === 'localhost' || u.hostname === '127.0.0.1')
+          && Number(u.port || 80) === SERVER_PORT && u.protocol === 'http:') return;
     } catch {}
     event.preventDefault();
   });
@@ -231,8 +267,87 @@ function createWindow() {
 
 // ── IPC handlers ─────────────────────────────────────────────────────────────
 
+function nativePlayerRequest(route, body, timeout = 650000) {
+  return new Promise((resolve, reject) => {
+    const payload = body ? Buffer.from(JSON.stringify(body)) : null;
+    const request = http.request({ hostname: '127.0.0.1', port: SERVER_PORT, path: route,
+      method: payload ? 'POST' : 'GET', headers: payload ? {
+        'Content-Type': 'application/json', 'Content-Length': payload.length,
+      } : {} }, response => {
+      let data = '';
+      response.on('data', chunk => { data += chunk; if (data.length > 65536) request.destroy(new Error('Invalid player response')); });
+      response.on('end', () => {
+        try { resolve(JSON.parse(data)); } catch { reject(new Error('Invalid player response')); }
+      });
+    });
+    request.setTimeout(timeout, () => request.destroy(new Error('Player request timed out')));
+    request.on('error', reject);
+    request.end(payload);
+  });
+}
+
+function isPlayerSender(event) {
+  if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) return false;
+  const frame = event.senderFrame;
+  if (frame && frame !== mainWindow.webContents.mainFrame) return false;
+  try {
+    const url = new URL(frame?.url || mainWindow.webContents.getURL());
+    return url.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(url.hostname)
+      && Number(url.port || 80) === SERVER_PORT;
+  } catch { return false; }
+}
+
+ipcMain.handle('kente:native:launch', async (event, game, rect) => {
+  if (!isPlayerSender(event) || process.platform !== 'win32') return { success: false, error: 'NATIVE_UNAVAILABLE' };
+  if (!game || typeof game.systemId !== 'string' || typeof game.title !== 'string') return { success: false, error: 'INVALID_GAME' };
+  const handle = mainWindow.getNativeWindowHandle();
+  const hwnd = handle.length === 8 ? handle.readBigUInt64LE().toString() : String(handle.readUInt32LE());
+  try {
+    return await nativePlayerRequest('/api/native/start', {
+      systemId: game.systemId, title: game.title, filename: game.filename || null,
+      exePath: game.exePath || null, host: { hwnd, rect, sessionId: game.sessionId },
+    });
+  } catch (error) { return { success: false, error: 'PLAYER_CONNECTION', message: error.message }; }
+});
+
+ipcMain.handle('kente:native:status', async event => {
+  if (!isPlayerSender(event)) return { running: false };
+  return nativePlayerRequest('/api/native/status', null, 3000);
+});
+
+ipcMain.handle('kente:native:import', async (event, engine) => {
+  if (!isPlayerSender(event) || !['pcsx2', 'dolphin', 'rpcs3', 'cemu', 'flycast', 'xemu', 'xenia', 'ryujinx'].includes(engine)) return { success: false };
+  const chosen = await dialog.showOpenDialog(mainWindow, { title: 'Add a portable game engine to Kente',
+    properties: ['openDirectory'], buttonLabel: 'Add to Kente' });
+  if (chosen.canceled || !chosen.filePaths.length) return { success: false, cancelled: true };
+  return nativePlayerRequest('/api/native/import', { engine, source: chosen.filePaths[0] });
+});
+
+ipcMain.handle('kente:native:control', async (event, action, rect, sessionId) => {
+  if (!isPlayerSender(event) || !['stop', 'resize', 'menu', 'resume'].includes(action)) return { success: false };
+  const result = await nativePlayerRequest('/api/native/control', { action, rect, sessionId }, 6000);
+  if (action === 'menu' || action === 'stop') {
+    mainWindow.focus();
+    mainWindow.webContents.focus();
+  }
+  return result;
+});
+
+ipcMain.handle('kente:lobby:captureSources', async event => {
+  if (!isPlayerSender(event)) return [];
+  const sources = await desktopCapturer.getSources({ types: ['window'], fetchWindowIcons: false });
+  return sources.filter(source => /kente/i.test(source.name))
+    .map(source => ({ id: source.id, name: source.name }));
+});
+
+ipcMain.handle('kente:lobby:remoteKey', async (event, key, down, sessionId) => {
+  if (!isPlayerSender(event) || typeof key !== 'string' || typeof down !== 'boolean') return { success: false };
+  return nativePlayerRequest('/api/native/remote-key', { key, down, sessionId }, 4000);
+});
+
 /** Renderer calls this after a native emulator (Dolphin etc.) exits. */
-ipcMain.on('kente:focusWindow', () => {
+ipcMain.on('kente:focusWindow', event => {
+  if (!isPlayerSender(event)) return;
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.restore();
     mainWindow.focus();
@@ -244,7 +359,8 @@ ipcMain.on('kente:focusWindow', () => {
  * can take over the full screen seamlessly — no Electron chrome visible.
  * Called just before the emulator process is spawned.
  */
-ipcMain.on('kente:hideWindow', () => {
+ipcMain.on('kente:hideWindow', event => {
+  if (!isPlayerSender(event)) return;
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.hide();
   }
@@ -254,7 +370,8 @@ ipcMain.on('kente:hideWindow', () => {
  * Restore and focus the window after the emulator exits.
  * The renderer polls /api/app/status and fires this when running → false.
  */
-ipcMain.on('kente:showWindow', () => {
+ipcMain.on('kente:showWindow', event => {
+  if (!isPlayerSender(event)) return;
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.show();
     mainWindow.focus();
@@ -269,16 +386,19 @@ ipcMain.on('kente:showWindow', () => {
  * will-navigate blocks any non-localhost top-frame navigation. This is
  * what stops embed-iframe ad scripts from popping the user's browser.
  */
-ipcMain.on('kente:theater:setActive', (_, active) => {
+ipcMain.on('kente:theater:setActive', (event, active) => {
+  if (!isPlayerSender(event)) return;
   _theaterActive = !!active;
 });
 
 // ── Window controls ─────────────────────────────────────────────────────────-
-ipcMain.on('kente:window:setFullScreen', (_, flag) => {
+ipcMain.on('kente:window:setFullScreen', (event, flag) => {
+  if (!isPlayerSender(event)) return;
   if (!mainWindow || mainWindow.isDestroyed()) return;
   mainWindow.setFullScreen(!!flag);
 });
-ipcMain.on('kente:window:toggleFullScreen', () => {
+ipcMain.on('kente:window:toggleFullScreen', event => {
+  if (!isPlayerSender(event)) return;
   if (!mainWindow || mainWindow.isDestroyed()) return;
   mainWindow.setFullScreen(!mainWindow.isFullScreen());
 });
@@ -294,14 +414,16 @@ function _clampToWindow(x, y) {
   return { x: cx, y: cy };
 }
 
-ipcMain.on('kente:input:mouseMove', (_, pos) => {
+ipcMain.on('kente:input:mouseMove', (event, pos) => {
+  if (!isPlayerSender(event)) return;
   if (!mainWindow || mainWindow.isDestroyed()) return;
   const { x, y } = _clampToWindow(pos?.x, pos?.y);
   if (!mainWindow.isFocused()) mainWindow.focus();
   mainWindow.webContents.sendInputEvent({ type: 'mouseMove', x, y, movementX: 0, movementY: 0 });
 });
 
-ipcMain.on('kente:input:mouseClick', (_, pos) => {
+ipcMain.on('kente:input:mouseClick', (event, pos) => {
+  if (!isPlayerSender(event)) return;
   if (!mainWindow || mainWindow.isDestroyed()) return;
   const { x, y } = _clampToWindow(pos?.x, pos?.y);
   if (!mainWindow.isFocused()) mainWindow.focus();
@@ -312,13 +434,16 @@ ipcMain.on('kente:input:mouseClick', (_, pos) => {
 });
 
 // Renderer → main: update Discord Rich Presence activity
-ipcMain.on('kente:discord:set', (_, data) => {
+ipcMain.on('kente:discord:set', (event, data) => {
+  if (!isPlayerSender(event)) return;
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return;
   if (!_rpc || !_rpcReady) return;
   _rpc.setActivity(data).catch(() => {});
 });
 
 // Renderer → main: clear activity (game ended in browser mode)
-ipcMain.on('kente:discord:clear', () => {
+ipcMain.on('kente:discord:clear', event => {
+  if (!isPlayerSender(event)) return;
   if (!_rpc || !_rpcReady) return;
   _rpc.setActivity({
     details:        'Browsing the collection',
@@ -333,10 +458,33 @@ ipcMain.on('kente:discord:clear', () => {
 // Checks GitHub releases for a newer version on every launch.
 // In dev mode (app.isPackaged === false) this block is skipped entirely.
 
+let _autoUpdater = null;
+let _updateCheck = null;
+
+function checkForAppUpdates() {
+  if (!app.isPackaged) return Promise.resolve({ success: false, message: 'Updates are available in an installed build.' });
+  if (!_autoUpdater) return Promise.resolve({ success: false, message: 'The updater is not available for this build.' });
+  if (_updateCheck) return _updateCheck;
+  _updateCheck = _autoUpdater.checkForUpdates().then(result => {
+    const version = result?.updateInfo?.version || app.getVersion();
+    const current = app.getVersion().split(/[.+-]/).map(Number);
+    const next = String(version).split(/[.+-]/).map(Number);
+    let available = false;
+    for (let i = 0; i < Math.max(current.length, next.length); i++) {
+      if ((next[i] || 0) === (current[i] || 0)) continue;
+      available = (next[i] || 0) > (current[i] || 0);
+      break;
+    }
+    return { success: true, available, version };
+  }).finally(() => { _updateCheck = null; });
+  return _updateCheck;
+}
+
 function setupAutoUpdater() {
   if (!app.isPackaged) return;   // no-op in dev
   try {
     const { autoUpdater } = require('electron-updater');
+    _autoUpdater = autoUpdater;
     autoUpdater.autoDownload    = true;
     autoUpdater.autoInstallOnAppQuit = true;
 
@@ -368,7 +516,7 @@ function setupAutoUpdater() {
     const finish = (ok) => {
       if (done) return;
       done = true;
-      if (ok) autoUpdater.checkForUpdates().catch(() => {});
+      if (ok) checkForAppUpdates().catch(() => {});
     };
     const tid = setTimeout(() => finish(false), 1200);
     dns.lookup('github.com', err => { clearTimeout(tid); finish(!err); });
@@ -376,6 +524,12 @@ function setupAutoUpdater() {
     console.warn('[kente] electron-updater not available:', err.message);
   }
 }
+
+ipcMain.handle('kente:update:check', async event => {
+  if (!isPlayerSender(event)) return { success: false, message: 'Update check is unavailable.' };
+  try { return await checkForAppUpdates(); }
+  catch (error) { return { success: false, message: error.message || 'Could not check for updates.' }; }
+});
 
 // ── App lifecycle ─────────────────────────────────────────────────────────────
 
@@ -433,18 +587,21 @@ function ensureBiosSetup() {
 }
 
 app.whenReady().then(async () => {
+  console.log('[kente] Electron ready');
   startServer();
   try {
     await waitForServer();
+    console.log('[kente] Server ready; opening window');
     createWindow();
     setupAutoUpdater();
     // Ensure all emulator OS dependencies are installed.
     // Runs 4 s after window shows so paint isn't blocked.
-    setTimeout(ensureEmulatorDeps, 4000);
+    // Native engines are provisioned inside Kente when their game is launched.
+    // A fresh app must not install unrelated OS applications in the background.
     // Seed EmulatorJS core cache in the background (enables offline play).
     setTimeout(ensureEmulatorJSOfflinePack, 4500);
     // Copy/configure provided BIOS files into native emulators where applicable.
-    setTimeout(ensureBiosSetup, 5500);
+    // Firmware and BIOS paths are configured when their private engine starts.
     setTimeout(initDiscord, 2000);   // after window is visible, connect Discord
   } catch (err) {
     console.error('[kente] Could not start server:', err.message);
@@ -461,4 +618,12 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
 
+let _gracefulQuit = false;
+app.on('before-quit', event => {
+  if (_gracefulQuit || !serverProcess || serverProcess.exitCode !== null) return;
+  event.preventDefault();
+  _gracefulQuit = true;
+  nativePlayerRequest('/api/native/control', { action: 'stop' }, 5000)
+    .catch(() => {}).finally(() => app.quit());
+});
 app.on('will-quit', () => { killServer(); destroyDiscord(); });

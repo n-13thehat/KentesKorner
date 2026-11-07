@@ -92,4 +92,4 @@ const AttractMode = (() => {
 /* ══════════════════════════════════════════
    KICK IT OFF
 ══════════════════════════════════════════ */
-document.addEventListener('DOMContentLoaded', boot);
+document.addEventListener('DOMContentLoaded', () => { PlayTogether.init(); boot(); });

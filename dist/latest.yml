@@ -1,8 +1,8 @@
-version: 7.1.4
+version: 8.3.2
 files:
-  - url: KenteCorner 7.7.7 Installer.exe
-    sha512: OGn2nLs4nfV5RHJaN3ks81uoMf/ez7eLh7ybDI1muAhSDJwFI/lZqNDMKADRiry3ExdaP9K8bmwHbLIMpwRNUg==
-    size: 339502738
-path: KenteCorner 7.7.7 Installer.exe
-sha512: OGn2nLs4nfV5RHJaN3ks81uoMf/ez7eLh7ybDI1muAhSDJwFI/lZqNDMKADRiry3ExdaP9K8bmwHbLIMpwRNUg==
-releaseDate: '2026-10-29T23:05:56.356Z'
+  - url: kentecorner-setup-8.3.2.exe
+    sha512: 9WMOr7zcuARfzUnpWY+vd3QhjsiWmXsQ3yt5XXWm4XgTOEVH0PpPouvh3zQXa3KPo1u8QcWN9W5p3L8eVmSIyA==
+    size: 339516250
+path: kentecorner-setup-8.3.2.exe
+sha512: 9WMOr7zcuARfzUnpWY+vd3QhjsiWmXsQ3yt5XXWm4XgTOEVH0PpPouvh3zQXa3KPo1u8QcWN9W5p3L8eVmSIyA==
+releaseDate: '2026-11-07T20:54:57.664Z'

@@ -9,6 +9,7 @@ let _currentBiosUrl = null;
 let _flashIframe    = null;   // active Flash iframe (for gamepad relay)
 let _flashRelayRaf  = null;   // rAF handle for the relay loop
 let _flycastPatchApplied = false;
+let _cancelEjsStartup = null;
 
 function _applyFlycastWebgl2Patch() {
   // Avoid re-wrapping getContext / console.warn across launches.
@@ -132,19 +133,23 @@ async function launchWithEmulatorJS(game, handleOrUrl, cloudRomData = null) {
   // ── BIOS check ──
   const biosReq = BIOS_MAP[game.systemId];
   let biosUrl = null;
+  let biosFile = null;
+  let biosFilename = '';
   if (biosReq) {
     const biosHandle = await BiosDB.get(game.systemId);
     if (biosHandle) {
       try {
         const perm = await biosHandle.queryPermission?.({ mode: 'read' });
         if (perm === 'granted' || perm === undefined) {
-          const biosFile = await biosHandle.getFile();
+          biosFile = await biosHandle.getFile();
           biosUrl = URL.createObjectURL(biosFile);
+          biosFilename = biosFile.name || biosReq.filename;
         } else {
           const newPerm = await biosHandle.requestPermission?.({ mode: 'read' });
           if (newPerm === 'granted') {
-            const biosFile = await biosHandle.getFile();
+            biosFile = await biosHandle.getFile();
             biosUrl = URL.createObjectURL(biosFile);
+            biosFilename = biosFile.name || biosReq.filename;
           } else {
             await BiosDB.remove(game.systemId);
           }
@@ -238,7 +243,7 @@ async function launchWithEmulatorJS(game, handleOrUrl, cloudRomData = null) {
         if (_currentRomUrl?.startsWith('blob:')) URL.revokeObjectURL(_currentRomUrl);
         _currentRomUrl = URL.createObjectURL(new Blob(dlChunks));
         // Extract filename from the URL path for format detection
-        romName = decodeURIComponent(handleOrUrl.split('/').pop().split('?')[0]) || game.title;
+        romName = cloudRomData?.filename || decodeURIComponent(handleOrUrl.split('/').pop().split('?')[0]) || game.title;
         if (statusEl()) statusEl().textContent = 'ROM READY — STARTING EMULATOR...';
       } catch (dlErr) {
         overlay.classList.remove('active');
@@ -291,9 +296,37 @@ async function launchWithEmulatorJS(game, handleOrUrl, cloudRomData = null) {
   // NOT physical controller support. Enabling it can interfere with canvas focus and
   // input routing on desktop. Physical gamepads are handled by the keyboard bridge below.
   // Leave it unset (false/default) so no on-screen overlay is created.
-  if (_currentBiosUrl) window.EJS_biosUrl = _currentBiosUrl;
+  delete window.EJS_biosUrl;
+  delete window.EJS_externalFiles;
+  if (_currentBiosUrl) {
+    // EmulatorJS names a raw BIOS after its URL. Blob URLs lose the filename,
+    // so PCSX-ReARMed cannot find the BIOS and silently uses its HLE fallback.
+    // External files give the raw PS1 BIOS its expected name in the core's FS.
+    if (game.systemId === 'ps1' && !/\.(zip|7z|rar)$/i.test(biosFilename)) {
+      window.EJS_externalFiles = { ['/' + biosReq.filename]: biosFile };
+    } else {
+      window.EJS_biosUrl = _currentBiosUrl;
+    }
+  }
 
   // ── Lifecycle callbacks ──
+  let finishStartup;
+  const startup = new Promise(resolve => { finishStartup = resolve; });
+  let settled = false;
+  const settle = result => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(startupTimeout);
+    if (_cancelEjsStartup === cancelStartup) _cancelEjsStartup = null;
+    finishStartup(result);
+  };
+  const cancelStartup = () => settle({ success: false, cancelled: true });
+  const startupTimeout = setTimeout(() => settle({ success: false, error: 'EMULATOR_START_TIMEOUT' }), 180000);
+  _cancelEjsStartup = cancelStartup;
+  window.EJS_onGameError = (message, instance) => {
+    if (instance && window.EJS_emulator && instance !== window.EJS_emulator) return;
+    settle({ success: false, error: message });
+  };
   // EJS_ready fires once the emulator UI is mounted (not yet running the game)
   window.EJS_ready = () => {
     const spinner = document.getElementById('ejs-load-spinner');
@@ -335,6 +368,7 @@ async function launchWithEmulatorJS(game, handleOrUrl, cloudRomData = null) {
   };
   // EJS_onGameStart fires when emulation actually begins
   window.EJS_onGameStart = () => {
+    settle({ success: true });
     // Remove any lingering spinner overlay — EJS has taken over the canvas
     const spinnerWrap = document.getElementById('ejs-load-spinner')?.parentElement;
     if (spinnerWrap?.style?.position === 'absolute') spinnerWrap.remove();
@@ -407,6 +441,7 @@ async function launchWithEmulatorJS(game, handleOrUrl, cloudRomData = null) {
   script.id  = 'ejs-loader';
   script.src = ejsBase + 'loader.js';
   script.onerror = async () => {
+    settle({ success: false, error: 'EMULATOR_LOADER_FAILED' });
     console.error(`[EJS] Failed to load EmulatorJS loader: ${script.src}`);
     overlay.classList.remove('active');
     cloudBadge.hidden = true; saveBtn.hidden = true;
@@ -438,4 +473,5 @@ async function launchWithEmulatorJS(game, handleOrUrl, cloudRomData = null) {
     KenteAudio.setHumVol(0.018);
   };
   document.body.appendChild(script);
+  return startup;
 }

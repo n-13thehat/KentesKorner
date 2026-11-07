@@ -46,6 +46,11 @@ class OriginAllowedTests(unittest.TestCase):
         # Malformed Origin should not be treated as missing.
         self.assertFalse(origin_allowed('not a url'))
         self.assertFalse(origin_allowed('javascript:alert(1)'))
+        for origin in ('ftp://localhost', 'http://localhost:invalid',
+                       'http://user@localhost', 'http://localhost/path',
+                       'http://localhost?query=1', 'http://localhost#fragment'):
+            with self.subTest(origin=origin):
+                self.assertFalse(origin_allowed(origin))
 
 
 class SafeResolveTests(unittest.TestCase):

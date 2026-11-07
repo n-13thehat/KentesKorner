@@ -24,10 +24,13 @@ const CLOUD_PROVIDERS = {
     sysMap: {
       nes:        'NES',     snes:       'SNES',    n64:       'N64',
       gameboy:    'GB',      gbc:        'GBC',     gba:       'GBA',
-      genesis:    'Genesis', gamecube:   'GC',      wii:       'Wii',
-      ps1:        'PS1',     ps2:        'PS2',     psp:       'PSP',
-      saturn:     'Saturn',  dreamcast:  'DC',
-      atari2600:  'Atari2600', atari7800: 'Atari7800', turbografx: 'TG16',
+      mastersys:  'SMS',     gamegear:   'GG',      genesis:    'Genesis',
+      segacd:     'SegaCD',  sega32x:    '32X',     gamecube:   'GameCube',
+      wii:        'Wii',     nds:        'DS',      ps1:        'PS1',
+      ps2:        'PS2',     ps3:        'PS3',     psp:        'PSP',
+      xbox:       'Xbox',    xbox360:    'Xbox360', saturn:     'Saturn',
+      dreamcast:  'Dreamcast', turbografx: 'TG16',  atari2600:  'Atari2600',
+      atari7800:  'Atari7800',
     },
     buildSearchUrl(sysCode, title) {
       const params = new URLSearchParams({ p: 'list' });
@@ -466,12 +469,12 @@ function openCloudBrowser(providerId = 'archive', preTitle = '', preSystemId = n
   if (preTitle || preSystemId) runCloudSearch();
 }
 
-/* Renders the manual search / redirect UI for link-type providers (Vimm's Lair, etc.).
-   System chips come from the provider's own sysMap.
-   Search button opens the provider's site in a new tab — no API calls made.          */
+/* Link-listed ROM providers that also have an in-app backend scraper use the
+   same provider search and Download Center flow as the other sources. */
 function _openLinkProviderBrowser(provider, preTitle = '', preSystemId = null) {
   const systemsEl = document.getElementById('cloud-systems');
-  const entries   = Object.entries(provider.sysMap || {});
+  const entries   = Object.entries(provider.sysMap || {}).filter(([sysId]) =>
+    SYSTEMS.some(system => system.id === sysId && !system.sacrificed));
 
   systemsEl.innerHTML = entries.map(([sysId, sysCode]) => {
     const sys = SYSTEMS.find(s => s.id === sysId);
@@ -486,54 +489,83 @@ function _openLinkProviderBrowser(provider, preTitle = '', preSystemId = null) {
       chip.classList.add('active');
       _cloudState.systemId  = chip.dataset.sys;
       _cloudState._sysCode  = chip.dataset.syscode;
+      if (input.value.trim()) runLinkProviderSearch(provider);
     });
   });
 
   const input = document.getElementById('cloud-search-input');
   input.value = preTitle;
-
-  const openSite = () => {
-    const title      = input.value.trim();
-    const activeChip = systemsEl.querySelector('.cloud-sys-chip.active');
-    const sysCode    = activeChip ? activeChip.dataset.syscode : '';
-    const url        = provider.buildSearchUrl(sysCode, title);
-    window.open(url, '_blank', 'noopener');
-    showToast(`↗ OPENED ${provider.name.toUpperCase()} IN NEW TAB`);
-  };
-
-  document.getElementById('cloud-search-btn').onclick = openSite;
-  input.onkeydown = e => { if (e.key === 'Enter') openSite(); };
-
-  // Replace the two-pane search layout with a single instruction + open button
-  document.getElementById('cloud-results-list').innerHTML = `
-    <div style="padding:28px 20px;text-align:center;font-family:var(--font-mono)">
-      <div style="color:#2a2a2a;font-size:10px;letter-spacing:0.15em;line-height:2.4;max-width:260px;margin:0 auto 20px">
-        SELECT A SYSTEM ABOVE AND ENTER A TITLE,<br>
-        THEN CLICK OPEN TO SEARCH ${escHtml(provider.name.toUpperCase())} IN YOUR BROWSER.
-      </div>
-      <button id="link-provider-open-btn"
-        style="width:100%;background:#0a1a0a;border:1px solid #1a3a1a;color:#30d880;
-               font-family:var(--font-mono);font-size:10px;letter-spacing:0.2em;
-               padding:16px 0;cursor:pointer;margin-bottom:12px">
-        ↗ &nbsp;OPEN ON ${escHtml(provider.name.toUpperCase())}
-      </button>
-      <div style="color:#1a1a1a;font-size:9px;letter-spacing:0.1em;line-height:2.2">
-        DOWNLOAD THE ROM FILE FROM THEIR SITE.<br>
-        THEN PRESS ✕ EXIT AND USE<br>
-        LOAD ROM FILE TO PLAY.
-      </div>
-    </div>`;
-
-  document.getElementById('cloud-files-list').innerHTML = `
-    <div style="padding:28px 20px;text-align:center;font-family:var(--font-mono);
-                color:#1e1e1e;font-size:9px;letter-spacing:0.12em;line-height:2.5">
-      ${escHtml(provider.name.toUpperCase())} IS A MANUAL DOWNLOAD SITE.<br>
-      THEIR LIBRARY IS WELL-CURATED AND FAST.<br>
-      NO ACCOUNT REQUIRED FOR MOST TITLES.
-    </div>`;
-
+  const sourceAvailable = ['vimm', 'cdromance'].includes(provider.id);
+  const search = () => runLinkProviderSearch(provider);
+  document.getElementById('cloud-search-btn').onclick = search;
+  input.onkeydown = e => { if (e.key === 'Enter') search(); };
+  document.getElementById('cloud-results-list').innerHTML = sourceAvailable
+    ? '<p class="cloud-empty">SELECT A SYSTEM, ENTER A GAME TITLE, AND SEARCH. RESULTS STAY IN KENTE.</p>'
+    : `<p class="cloud-empty">${escHtml(provider.name.toUpperCase())} DOES NOT HAVE AN IN-APP DOWNLOAD CONNECTOR YET.</p>`;
+  document.getElementById('cloud-files-list').innerHTML =
+    '<p class="cloud-empty">SELECT A PROVIDER RESULT TO REVIEW THE FILE AND DOWNLOAD IT TO KENTE\'S ROM LIBRARY.</p>';
   document.getElementById('cloud-download-bar').classList.add('hidden');
-  document.getElementById('link-provider-open-btn').addEventListener('click', openSite);
+  if (preTitle && preSystemId && sourceAvailable) search();
+}
+
+let _linkProviderSearchGen = 0;
+
+async function runLinkProviderSearch(provider) {
+  const gen = ++_linkProviderSearchGen;
+  const resList = document.getElementById('cloud-results-list');
+  const filesList = document.getElementById('cloud-files-list');
+  const query = document.getElementById('cloud-search-input').value.trim();
+  const systemId = _cloudState.systemId;
+  if (!['vimm', 'cdromance'].includes(provider.id)) return;
+  if (!systemId || !query) {
+    resList.innerHTML = '<p class="cloud-empty">SELECT A SYSTEM AND ENTER A GAME TITLE.</p>';
+    return;
+  }
+  if (!KENTE_SERVER_ONLINE) {
+    resList.innerHTML = '<p class="cloud-empty">START KENTE SERVER TO SEARCH AND DOWNLOAD PROVIDER FILES IN APP.</p>';
+    return;
+  }
+  resList.innerHTML = '<p class="cloud-empty">SEARCHING ' + escHtml(provider.name.toUpperCase()) + ' IN KENTE...</p>';
+  filesList.innerHTML = '<p class="cloud-empty">WAITING FOR SEARCH RESULTS...</p>';
+  const candidates = await fetchRomSources(systemId, query, [provider.id]);
+  if (gen !== _linkProviderSearchGen || _cloudState.providerId !== provider.id ||
+      _cloudState.systemId !== systemId || document.getElementById('cloud-search-input').value.trim() !== query) return;
+  _cloudState.providerCandidates = candidates;
+  if (!candidates.length) {
+    resList.innerHTML = `<p class="cloud-empty">NO MATCHING ${escHtml(provider.name.toUpperCase())} FILES FOUND.</p>`;
+    filesList.innerHTML = '<p class="cloud-empty">TRY ANOTHER TITLE OR SYSTEM.</p>';
+    return;
+  }
+  resList.innerHTML = candidates.map((candidate, index) => {
+    const size = candidate.size ? (Number(candidate.size) / 1048576).toFixed(1) + ' MB' : '—';
+    return `<div class="cloud-result-row" data-provider-candidate="${index}">
+      <div class="cloud-result-title">${escHtml(candidate.filename)}</div>
+      <div class="cloud-result-meta">${escHtml(provider.name.toUpperCase())} · ${size}</div>
+    </div>`;
+  }).join('');
+  resList.querySelectorAll('[data-provider-candidate]').forEach(row => {
+    row.addEventListener('click', () => {
+      resList.querySelectorAll('.cloud-result-row').forEach(item => item.classList.remove('active'));
+      row.classList.add('active');
+      const candidate = _cloudState.providerCandidates[Number(row.dataset.providerCandidate)];
+      if (!candidate) return;
+      const game = findGameForDownload(systemId, candidate.filename) || {
+        id: `provider_${systemId}_${Date.now()}`,
+        title: candidate.filename.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').trim(),
+        system: SYSTEMS.find(s => s.id === systemId)?.name || systemId.toUpperCase(),
+        systemId, tier: 3, img: null,
+      };
+      const size = candidate.size ? (Number(candidate.size) / 1048576).toFixed(1) + ' MB' : '—';
+      filesList.innerHTML = `<div class="cloud-file-row">
+        <span class="cloud-file-name" title="${escHtml(candidate.filename)}">${escHtml(candidate.filename)}</span>
+        <span class="cloud-file-size">${size}</span>
+        <button class="cloud-dl-btn">↓ DOWNLOAD TO KENTE</button>
+      </div><p class="cloud-empty">SAVED TO KENTE'S ROM LIBRARY FOR ${escHtml(game.system.toUpperCase())}. DOWNLOADS CAN BE OPENED FROM DOWNLOAD CENTER.</p>`;
+      filesList.querySelector('.cloud-dl-btn').addEventListener('click', async event => {
+        await startCloudDownload(systemId, candidate.filename, candidate.url, event.currentTarget);
+      });
+    });
+  });
 }
 
 // Monotonically-incrementing counter — lets concurrent searches detect staleness.
@@ -724,6 +756,7 @@ function findGameForDownload(systemId, filename) {
   const baseName = norm(filename.replace(/\.[^.]+$/, ''));
   return window.KenteLibrary?.games.find(g => {
     if (g.systemId !== systemId) return false;
+    if (!romTitleMatches(filename, g.title)) return false;
     const t = norm(g.title);
     return t === baseName || baseName.includes(t) || t.includes(baseName);
   }) || null;

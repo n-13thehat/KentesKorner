@@ -8,11 +8,16 @@ resources/dolphin/
 !resources/dolphin/.gitkeep
 # Compiled Python server (produced by `npm run build:server`)
 resources/kente-server.exe
+resources/emulators/
+resources/runtime-dlls/
 
 # ── User data (lives in %APPDATA%/KenteCorner/ at runtime) ──────────────────
 roms/
 saves/
 bios/
+
+# Optional local API keys and Discord configuration
+artkeys.json
 
 # ── Python build artifacts ───────────────────────────────────────────────────
 __pycache__/

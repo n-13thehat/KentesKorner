@@ -12,10 +12,94 @@ function normalizeTitle(str) {
     .trim();
 }
 
+function romTitleMatches(fileName, title) {
+  const roman = { i:'1', ii:'2', iii:'3', iv:'4', v:'5', vi:'6', vii:'7', viii:'8',
+                  ix:'9', x:'10', xi:'11', xii:'12', xiii:'13', xiv:'14', xv:'15' };
+  const words = value => normalizeTitle(String(value).replace(/\([^)]*\)|\[[^\]]*\]/g, ' '))
+    .split(' ').filter(w => w.length > 2 || /^\d+$/.test(w) || Object.hasOwn(roman, w))
+    .map(w => roman[w] || w);
+  const requested = new Set(words(title));
+  const candidate = new Set(words(fileName));
+  if ([...requested].some(w => /^\d+$/.test(w) && !candidate.has(w))) return false;
+  return requested.size > 0 && [...requested].filter(w => candidate.has(w)).length / requested.size >= 0.5;
+}
+
+function validatePs1Content(fs, filename, visited = new Set()) {
+  const normalizePath = path => {
+    const parts = [];
+    for (const part of String(path).replace(/\\/g, '/').split('/')) {
+      if (!part || part === '.') continue;
+      if (part === '..') parts.pop(); else parts.push(part);
+    }
+    return '/' + parts.join('/');
+  };
+  const exists = path => { try { return !!fs.analyzePath(path).exists; } catch { return false; } };
+  const locate = path => {
+    if (exists(path)) return path;
+    if (typeof fs.readdir !== 'function') return null;
+    let current = '';
+    try {
+      for (const part of path.split('/').filter(Boolean)) {
+        const actual = fs.readdir(current || '/').find(name => name.toLowerCase() === part.toLowerCase());
+        if (!actual) return null;
+        current += '/' + actual;
+      }
+      return current;
+    } catch { return null; }
+  };
+  if (!filename) return 'PS1 DISC ERROR: The archive contained no playable disc image.';
+  const path = normalizePath(filename);
+  if (visited.has(path)) return 'PS1 DISC ERROR: The disc playlist contains a circular reference.';
+  visited.add(path);
+  if (!exists(path)) return 'PS1 DISC ERROR: The selected disc file was not extracted.';
+  if (/\.ecm$/i.test(path)) return 'PS1 DISC ERROR: This source contains an ECM-encoded disc. A decoded BIN/CUE or PBP is needed.';
+  if (!/\.(cue|m3u)$/i.test(path)) {
+    try {
+      if (fs.stat(path).size < 2048) return 'PS1 DISC ERROR: The downloaded file is too small to be a disc image.';
+    } catch { return 'PS1 DISC ERROR: The disc image could not be read.'; }
+    return null;
+  }
+  const folder = path.slice(0, path.lastIndexOf('/') + 1);
+  let text;
+  try { text = fs.readFile(path, { encoding: 'utf8' }); }
+  catch { return 'PS1 DISC ERROR: The disc index could not be read.'; }
+  const refs = /\.cue$/i.test(path)
+    ? [...text.matchAll(/^\s*FILE\s+(?:"([^"]+)"|(\S+))/gmi)].map(match => match[1] || match[2])
+    : text.split(/\r?\n/).map(line => line.trim()).filter(line => line && !line.startsWith('#'));
+  if (!refs.length) return 'PS1 DISC ERROR: The disc index contains no tracks.';
+  const replacements = new Map();
+  for (const ref of refs) {
+    const target = normalizePath(ref.startsWith('/') ? ref : folder + ref);
+    const actual = locate(target);
+    if (!actual) {
+      if (locate(target + '.ecm')) return 'PS1 DISC ERROR: This source contains ECM-encoded tracks instead of the BIN files referenced by its cue sheet.';
+      return `PS1 DISC ERROR: Missing disc track: ${ref}. Use an archive containing the cue sheet and all tracks.`;
+    }
+    const from = folder.split('/').filter(Boolean), to = actual.split('/').filter(Boolean);
+    while (from.length && to.length && from[0] === to[0]) { from.shift(); to.shift(); }
+    const relative = [...from.map(() => '..'), ...to].join('/');
+    if (relative !== ref) replacements.set(ref, relative);
+    if (/\.m3u$/i.test(path)) {
+      const error = validatePs1Content(fs, actual, new Set(visited));
+      if (error) return error;
+    }
+  }
+  if (replacements.size && typeof fs.writeFile === 'function') {
+    const updated = /\.cue$/i.test(path)
+      ? text.replace(/^(\s*FILE\s+)(?:"([^"]+)"|(\S+))/gmi,
+          (line, prefix, quoted, plain) => `${prefix}"${replacements.get(quoted || plain) || quoted || plain}"`)
+      : text.split(/\r?\n/).map(line => replacements.get(line.trim()) || line).join('\n');
+    try { fs.writeFile(path, updated); }
+    catch { return 'PS1 DISC ERROR: The disc index paths could not be repaired.'; }
+  }
+  return null;
+}
+
 function matchRomToGame(fileName, games) {
   const fileBase = normalizeTitle(fileName.replace(/\.[^.]+$/, ''));
   let best = null, bestScore = 0;
   for (const g of games) {
+    if (!romTitleMatches(fileName, g.title)) continue;
     const titleNorm = normalizeTitle(g.title);
     // Exact match
     if (fileBase === titleNorm) return { game: g, score: 100 };
@@ -313,21 +397,13 @@ function showBiosPicker(game, romHandle, biosReq) {
       const file = input.files[0];
       if (!file) return;
       input.value = '';
-      // Use FSA handle if available so it persists across sessions
-      if ('showOpenFilePicker' in window) {
-        try {
-          const [fh] = await window.showOpenFilePicker({ multiple: false });
-          await BiosDB.set(game.systemId, fh, biosReq.filename);
-          showToast(`✓ ${biosReq.label.toUpperCase()} SAVED`);
-          launchWithEmulatorJS(game, romHandle);
-          return;
-        } catch { /* user cancelled FSA — fall through to plain File */ }
-      }
-      // Fallback: no persistence, launch directly
       const tempHandle = { getFile: async () => file, kind: 'file' };
-      await BiosDB.set(game.systemId, tempHandle, biosReq.filename).catch(() => {});
-      showToast(`✓ ${biosReq.label.toUpperCase()} LOADED`);
-      launchWithEmulatorJS(game, romHandle);
+      try {
+        await BiosDB.set(game.systemId, tempHandle, biosReq.filename);
+        showToast(`✓ ${biosReq.label.toUpperCase()} SAVED`);
+        if (CORE_MAP[game.systemId]) launchWithEmulatorJS(game, romHandle);
+        else launchGame(game);
+      } catch (error) { showToast('⚠ ' + error.message); }
     };
     input.click();
   });

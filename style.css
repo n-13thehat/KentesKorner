@@ -550,6 +550,41 @@ body { font-family: var(--font-ui); color: var(--text); }
   color: var(--text-dim); margin-bottom: 12px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+.source-game-search {
+  margin: 4px 0 30px; padding: 20px;
+  border: 1px solid color-mix(in srgb, var(--brand) 42%, var(--border));
+  background: linear-gradient(135deg, color-mix(in srgb, var(--brand) 7%, var(--panel)), var(--panel) 65%);
+  box-shadow: inset 0 0 28px rgba(0,0,0,.18);
+}
+.source-search-heading { display:flex; align-items:flex-start; justify-content:space-between; gap:18px; }
+.source-search-heading .section-label { margin:0 0 7px; color:var(--brand); }
+.source-search-heading p { margin:0 0 16px; color:var(--text-dim); font:10px/1.6 var(--font-mono); }
+.source-search-badge { flex-shrink:0; padding:6px 9px; border:1px solid var(--brand); color:var(--brand); font:9px var(--font-mono); letter-spacing:.12em; }
+.source-game-search-controls { display:grid; grid-template-columns:minmax(180px,1fr) minmax(170px,.48fr) auto; gap:9px; }
+.source-game-search-controls input, .source-game-search-controls select {
+  min-width:0; height:40px; padding:0 12px; border:1px solid var(--border);
+  border-radius:0; outline:0; background:rgba(0,0,0,.28); color:var(--white); font:10px var(--font-mono);
+}
+.source-game-search-controls input:focus, .source-game-search-controls select:focus { border-color:var(--brand); }
+.source-game-search-controls select option { background:var(--panel); color:var(--white); }
+.source-game-search-controls button, .source-game-download {
+  min-height:40px; padding:0 16px; border:1px solid var(--brand); background:var(--brand);
+  color:#071009; cursor:pointer; font:700 9px var(--font-mono); letter-spacing:.1em; white-space:nowrap;
+}
+.source-game-search-controls button:hover, .source-game-download:hover { filter:brightness(1.12); }
+.source-game-search-hint { margin:10px 0 14px; color:var(--text-dim); font:8px var(--font-mono); letter-spacing:.1em; }
+.source-game-search-results { display:grid; gap:8px; }
+.source-search-empty { padding:14px; border:1px dashed var(--border); color:var(--text-dim); font:9px/1.6 var(--font-mono); letter-spacing:.06em; }
+.source-game-result {
+  display:grid; grid-template-columns:minmax(160px,1.2fr) minmax(300px,2fr) auto;
+  align-items:center; gap:14px; padding:12px; border:1px solid var(--border); background:rgba(0,0,0,.2);
+}
+.source-game-result-title { color:var(--white); font:700 11px var(--font-hd); letter-spacing:.04em; }
+.source-game-result-file { overflow:hidden; margin-top:5px; color:var(--text-dim); font:8px var(--font-mono); text-overflow:ellipsis; white-space:nowrap; }
+.source-game-result-meta { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px; }
+.source-game-result-meta span { min-width:0; overflow:hidden; color:var(--white); font:9px var(--font-mono); text-overflow:ellipsis; white-space:nowrap; }
+.source-game-result-meta small { display:block; margin-bottom:4px; color:var(--text-dim); font-size:7px; letter-spacing:.12em; }
+.source-game-download { min-height:34px; padding:0 11px; }
 .source-status {
   display: inline-flex; align-items: center; gap: 6px;
   font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.15em;
@@ -1555,6 +1590,10 @@ body[data-theme="copper"] {
   transition: opacity 0.3s ease;
 }
 #emulator-overlay.active { opacity: 1; pointer-events: all; }
+.native-player-loading { height: 100%; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 20px; color: #777;
+  font: 10px var(--font-mono); letter-spacing: .12em; }
+.native-player-status { color: var(--brand); font-size: 12px; }
 
 #ejs-hud {
   display: flex; align-items: center; gap: 16px;
@@ -1912,6 +1951,11 @@ body[data-theme="copper"] {
 .cloud-dl-btn.success { background: #1db954; border-color: #1db954; color: #000; pointer-events: none; }
 .cloud-dl-btn.queued  { background: var(--brand); border-color: var(--brand); color: #000; opacity: 0.65; pointer-events: none; }
 .cloud-dl-btn.busy    { opacity: 0.4; pointer-events: none; }
+
+#col-provider-results { margin-top: 20px; border: 1px solid var(--border); }
+#col-provider-results .section-label { margin: 0; padding: 12px 16px; }
+.col-provider-row { min-width: 0; }
+.col-provider-row .cloud-file-name { line-height: 1.5; }
 
 /* Download progress */
 #cloud-download-bar {
@@ -3832,3 +3876,98 @@ body.attract-mode .tv-zone          { box-shadow: 0 0 28px rgba(255,255,255,0.04
   font-size: 9px; letter-spacing: 0.22em; color: var(--text-dim);
 }
 .osk-legend b { color: var(--brand); font-weight: 700; margin-right: 4px; }
+
+@media (max-width: 900px) {
+  .source-game-result { grid-template-columns:minmax(0,1fr) auto; }
+  .source-game-result-main { grid-column:1 / -1; }
+  .source-game-result-meta { grid-column:1 / -1; }
+}
+@media (max-width: 600px) {
+  .source-game-search { padding:14px; }
+  .source-search-heading { display:block; }
+  .source-search-badge { display:inline-block; margin-bottom:12px; }
+  .source-game-search-controls { grid-template-columns:1fr; }
+  .source-game-result { grid-template-columns:1fr; }
+  .source-game-result-main, .source-game-result-meta { grid-column:1; }
+  .source-game-result-meta { grid-template-columns:repeat(2,minmax(0,1fr)); }
+}
+
+/* ═══════════════════════════════════════════
+   PLAY TOGETHER — PS2 ROOM LOBBY
+═══════════════════════════════════════════ */
+#play-together-overlay {
+  position: fixed; inset: 0; z-index: 1200; display: flex; align-items: center; justify-content: center;
+  padding: 18px; background: rgba(0,0,0,.82); backdrop-filter: blur(8px);
+  opacity: 0; pointer-events: none; transition: opacity .2s ease;
+}
+#play-together-overlay.active { opacity: 1; pointer-events: auto; }
+#pt-panel {
+  width: min(520px, 100%); max-height: min(92dvh, 820px); overflow: auto; padding: 24px;
+  border: 1px solid rgba(232,160,0,.42); background: linear-gradient(145deg,#10101b,#07070d 70%);
+  box-shadow: 0 0 48px rgba(232,160,0,.12); color: var(--text);
+}
+.pt-header { display:flex; align-items:center; justify-content:space-between; margin-bottom:18px; }
+.pt-kicker { font: 9px var(--font-mono); letter-spacing:.25em; color:var(--brand); }
+#pt-title { margin:4px 0 0; font:700 20px var(--font-hd); letter-spacing:.16em; }
+#pt-close { background:transparent; border:1px solid var(--border); color:var(--text-dim); padding:7px 10px; cursor:pointer; }
+#pt-selected-game,#pt-room-game { margin:0 0 14px; color:var(--brand); font:10px var(--font-mono); letter-spacing:.15em; }
+#pt-status { min-height:20px; margin:12px 0; color:var(--green); font:10px var(--font-mono); letter-spacing:.1em; }
+#pt-status.error { color:var(--red); }
+#pt-start-view label { display:block; margin:14px 0 6px; color:var(--text-dim); font:9px var(--font-mono); letter-spacing:.16em; }
+#pt-start-view label small { color:#555; letter-spacing:.05em; }
+#pt-start-view input { box-sizing:border-box; width:100%; min-height:40px; padding:10px 12px; color:var(--text);
+  background:#090911; border:1px solid #292936; font:11px var(--font-mono); letter-spacing:.08em; }
+#pt-panel button:not(#pt-close) { display:block; width:100%; min-height:42px; margin-top:12px; cursor:pointer;
+  border:1px solid var(--brand); background:var(--brand); color:#090909; font:700 10px var(--font-mono); letter-spacing:.15em; }
+#pt-panel button.pt-secondary { background:transparent; color:var(--brand); }
+#pt-panel button:disabled { opacity:.4; cursor:default; }
+.pt-divider { margin:20px 0 8px; text-align:center; color:#59596a; font:9px var(--font-mono); letter-spacing:.2em; }
+.pt-network-note,.pt-stream-hint { color:#777; font:9px/1.7 var(--font-mono); letter-spacing:.08em; }
+.pt-code-wrap { display:flex; align-items:center; justify-content:space-between; padding:10px 14px; background:#15131a; }
+.pt-code-wrap span { color:#888; font:9px var(--font-mono); letter-spacing:.15em; }
+.pt-code-wrap strong { color:var(--brand); font:700 24px var(--font-mono); letter-spacing:.2em; }
+#pt-room-invite { margin:12px 0; color:#999; font:9px/1.7 var(--font-mono); word-break:break-word; }
+#pt-player-list { margin:18px 0; border-top:1px solid var(--border); }
+.pt-player-row { display:flex; justify-content:space-between; padding:11px 2px; border-bottom:1px solid var(--border); font:10px var(--font-mono); }
+.pt-player-row strong { color:#777; font-size:9px; letter-spacing:.12em; }
+.pt-player-row strong.ready { color:var(--green); }
+#pt-stream-view { min-height:55vh; }
+#pt-remote-video { display:block; width:100%; max-height:68vh; background:#000; object-fit:contain; outline:1px solid #333; }
+#pt-remote-video:focus { outline:2px solid var(--brand); }
+
+/* Accessibility defaults: preserve visible keyboard location and honor OS
+   preferences without changing the CRT look for users who want it. */
+:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 3px;
+}
+
+.kente-inline-status { line-height: 1.6; }
+.kente-status-retry {
+  margin: 8px 4px 0; padding: 8px 12px; border: 1px solid var(--brand);
+  background: transparent; color: var(--brand); cursor: pointer;
+  font: 700 9px var(--font-mono); letter-spacing: .12em;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+@media (prefers-contrast: more) {
+  :root { --text-dim: #b8bfd5; --border: #68708c; }
+  button, input, select, [tabindex]:not([tabindex="-1"]) { outline-offset: 3px; }
+}
+
+@media (max-width: 600px) {
+  #hud-ticker { display: none; }
+  #cloud-panel, #dl-panel, #repo-panel, #cal-panel {
+    width: min(calc(100vw - 20px), 720px);
+    max-height: calc(100dvh - 20px);
+  }
+  #cloud-body { min-height: 0; overflow: auto; }
+}

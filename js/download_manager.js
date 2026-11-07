@@ -30,10 +30,27 @@ const DownloadManager = (() => {
 
   function _mkItem(id, game) {
     return { id, game, status: 'queued', progress: 0, total: 0,
-             filename: null, archiveUrl: null, sourceName: null, error: null, _reader: null,
+             filename: null, archiveUrl: null, sourceName: null, error: null, _reader: null, _controller: null,
              _sources: null, _sourceIdx: null, _activeSource: null,
              _directUrl: null, _directFilename: null, autoLaunch: false,
              _attempt: 0, _speedMBs: 0, _etaSec: null, _lastBytes: 0, _lastTime: 0, _dlAt: null };
+  }
+
+  const _pendingKey = 'kente_pending_downloads_v1';
+  function _pendingGames() {
+    try {
+      const rows = JSON.parse(localStorage.getItem(_pendingKey) || '[]');
+      return Array.isArray(rows) ? rows.filter(row => row && typeof row.id === 'string'
+        && typeof row.title === 'string' && typeof row.systemId === 'string') : [];
+    } catch { return []; }
+  }
+  function _persistPending() {
+    const pending = _items.filter(item => item.status !== 'complete'
+      && !item._directUrl && !item._directFilename && item.game?.id)
+      .map(item => ({ id: String(item.game.id), title: String(item.game.title || item.game.id),
+        systemId: String(item.game.systemId || ''), system: String(item.game.system || ''),
+        year: String(item.game.year || '') }));
+    try { localStorage.setItem(_pendingKey, JSON.stringify(pending.slice(0, 100))); } catch {}
   }
 
   /* ── classify errors into user-readable messages ── */
@@ -76,8 +93,10 @@ const DownloadManager = (() => {
     const item = _mkItem(id, game);
     if (opts.url) item._directUrl = String(opts.url);
     if (opts.filename) item._directFilename = String(opts.filename);
+    if (opts.sourceName) item.sourceName = String(opts.sourceName);
     if (opts.autoLaunch) item.autoLaunch = true;
     _items.push(item);
+    _persistPending();
     _notify();
     showToast(`⬇ QUEUED — ${game.title.toUpperCase()}`);
     _tick();
@@ -88,15 +107,18 @@ const DownloadManager = (() => {
   function cancel(id) {
     const item = _items.find(i => i.id === id);
     if (!item) return;
-    if (item._reader) { item._reader.cancel().catch(() => {}); item._reader = null; }
     _items = _items.filter(i => i.id !== id);
-    if (['searching','downloading'].includes(item.status)) { _busy = false; _tick(); }
+    _persistPending();
+    item._controller?.abort(new DOMException('Download canceled', 'AbortError'));
+    // The queue worker owns _busy until its task has unwound. Starting another
+    // worker here lets the canceled task clear the next task's busy flag.
+    _tick();
     _notify();
   }
 
   /* ── remove: delete a completed/errored entry from panel + IndexedDB ── */
   async function remove(id) {
-    _items = _items.filter(i => i.id !== id);
+    cancel(id);
     await DownloadDB.remove(id).catch(() => {});
     _notify();
   }
@@ -109,6 +131,7 @@ const DownloadManager = (() => {
       status: 'queued', progress: 0, total: 0, error: null, _attempt: 0,
       _sources: null, _sourceIdx: null, _activeSource: null, sourceName: null,
     });
+    _persistPending();
     _notify();
     _tick();
   }
@@ -119,11 +142,11 @@ const DownloadManager = (() => {
     const item = _items.find(i => i.id === id);
     if (!item || !item._sources?.length) return;
     item._sourceIdx = ((item._sourceIdx || 0) + 1) % item._sources.length;
-    if (item._reader) { item._reader.cancel().catch(() => {}); item._reader = null; }
-    Object.assign(item, { status: 'queued', progress: 0, total: 0, error: null });
+    item._controller?.abort(new DOMException('Source changed', 'AbortError'));
+    Object.assign(item, { status: 'queued', progress: 0, total: 0, error: null, _attempt: 0 });
+    _persistPending();
     _notify();
-    if (!_busy) _tick();
-    else _download(item);  // resume in-place if currently the active item
+    _tick();
   }
 
   /* ── clearCompleted: remove all READY TO PLAY entries ── */
@@ -145,6 +168,13 @@ const DownloadManager = (() => {
     _busy = true;
     try {
       await _download(next);
+    } catch (err) {
+      if (_items.includes(next)) {
+        next.status = 'error';
+        next.error = _classifyError(err, null) || 'DOWNLOAD INTERRUPTED';
+        _notify();
+      }
+      console.error('[DownloadManager]', err);
     } finally {
       // Always clear the flag — even if _download() throws an unexpected exception
       // that wasn't caught internally.  Without this the queue freezes permanently.
@@ -155,54 +185,102 @@ const DownloadManager = (() => {
 
   /* ── Shared helpers for stream + completion (used by both new fast path
         and legacy archive-only path inside _download)                    */
-  async function _streamBodyInto(item, resp) {
-    item.total   = Number(resp.headers.get('Content-Length')) || item.total || 0;
-    item._reader = resp.body.getReader();
-    const _timedRead = r => Promise.race([
-      r.read(),
-      new Promise((_, rej) =>
-        setTimeout(() => rej(Object.assign(new Error('STREAM_TIMEOUT'), { name: 'TimeoutError' })),
-                   STREAM_CHUNK_TIMEOUT_MS)),
-    ]);
-    while (true) {
-      const { done, value } = await _timedRead(item._reader);
-      if (done) break;
-      item.progress += value.length;
-      const now = Date.now();
-      if (now - item._lastTime >= 800) {
-        const dt = (now - item._lastTime) / 1000;
-        const db = item.progress - item._lastBytes;
-        item._speedMBs = db / dt / 1_048_576;
-        item._lastBytes = item.progress;
-        item._lastTime = now;
-        if (item._speedMBs > 0 && item.total)
-          item._etaSec = (item.total - item.progress) / (item._speedMBs * 1_048_576);
+  function _withAbort(promise, signal) {
+    return new Promise((resolve, reject) => {
+      const onAbort = () => reject(signal.reason);
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+      Promise.resolve(promise).then(value => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      }, err => {
+        signal.removeEventListener('abort', onAbort);
+        reject(err);
+      });
+    });
+  }
+
+  function _pause(ms, signal) {
+    return new Promise(resolve => {
+      const finish = () => {
+        clearTimeout(timer);
+        signal.removeEventListener('abort', finish);
+        resolve();
+      };
+      const timer = setTimeout(finish, ms);
+      signal.addEventListener('abort', finish, { once: true });
+      if (signal.aborted) finish();
+    });
+  }
+
+  async function _streamBodyInto(item, resp, signal) {
+    const expected = Number(resp.headers.get('Content-Length')) || 0;
+    item.total = expected || item.total || 0;
+    const reader = resp.body.getReader();
+    item._reader = reader;
+    let complete = false;
+    try {
+      while (true) {
+        let timer;
+        const timeout = new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error('STREAM_TIMEOUT')), STREAM_CHUNK_TIMEOUT_MS);
+        });
+        let chunk;
+        try {
+          chunk = await _withAbort(Promise.race([reader.read(), timeout]), signal);
+        } finally {
+          clearTimeout(timer);
+        }
+        const { done, value } = chunk;
+        if (done) break;
+        item.progress += value.length;
+        const now = Date.now();
+        if (now - item._lastTime >= 800) {
+          const dt = (now - item._lastTime) / 1000;
+          const db = item.progress - item._lastBytes;
+          item._speedMBs = db / dt / 1_048_576;
+          item._lastBytes = item.progress;
+          item._lastTime = now;
+          if (item._speedMBs > 0 && item.total)
+            item._etaSec = (item.total - item.progress) / (item._speedMBs * 1_048_576);
+        }
+        _notify();
       }
-      _notify();
-    }
-    item._reader = null;
-    if (item.total > 0 && item.progress < item.total * 0.95) {
-      throw new Error(`INCOMPLETE (${(item.progress/1_048_576).toFixed(0)}/${(item.total/1_048_576).toFixed(0)} MB)`);
+      if (expected > 0 && item.progress !== expected) {
+        throw new Error(`INCOMPLETE (${item.progress}/${expected} bytes)`);
+      }
+      if (!item.progress) throw new Error('NO_STREAM');
+      complete = true;
+    } finally {
+      if (item._reader === reader) item._reader = null;
+      if (!complete) reader.cancel().catch(() => {});
+      try { reader.releaseLock(); } catch {}
     }
   }
 
   async function _markDownloadComplete(item) {
     item.status    = 'complete';
     item._speedMBs = 0; item._etaSec = null; item._dlAt = Date.now();
+    _persistPending();
     ROM_STATUS[item.game.id] = true;
     refreshGameCardDots();
     if (item.sourceName) RomSourceLedger.onSuccess(item.sourceName);
     _notify();
     // Live-refresh the Recently Downloaded shelf if the user is on Play/Collections
     try { _refreshRecentDownloadsShelf(); } catch {}
-    showToast(`✓ READY TO PLAY — ${item.game.title.toUpperCase()}`);
+    showToast(`✓ SAVED TO ROMS FOLDER — ${item.game.title.toUpperCase()}`);
     await DownloadDB.add({
       id: item.id, gameId: item.game.id, game: item.game,
       filename: item.filename, systemId: item.game.systemId,
       systemName: item.game.system || item.game.systemId.toUpperCase(),
       archiveUrl: item.archiveUrl, downloadedAt: item._dlAt, sizeBytes: item.progress,
       sourceName: item.sourceName || null,
+      storage: 'server',
     }).catch(() => {});
+    if (!_items.includes(item)) {
+      await DownloadDB.remove(item.id).catch(() => {});
+      return;
+    }
 
     // Auto-launch once (used when the user clicked a game that wasn't on disk yet).
     if (item.autoLaunch) {
@@ -219,6 +297,13 @@ const DownloadManager = (() => {
 
   /* ── _download: search + stream with auto-retry + multi-source fallback ── */
   async function _download(item) {
+    if (!_items.includes(item)) return;
+    const controller = new AbortController();
+    item._controller = controller;
+    const signal = controller.signal;
+    const wait = promise => _withAbort(promise, signal);
+    const deadline = setTimeout(() => controller.abort(
+      new DOMException('DOWNLOAD_TIMEOUT', 'TimeoutError')), PROXY_FETCH_TIMEOUT_MS);
     const RGN_USA  = /\((usa|world|en)\b/i;
     const RGN_EU   = /\((europe|eur|eu)\b/i;
     const RGN_JP   = /\((japan|jpn|jp)\b/i;
@@ -254,12 +339,11 @@ const DownloadManager = (() => {
           url: item._directUrl, save: '1',
           systemId: item.game.systemId, filename: item.filename,
         });
-        const resp = await fetch(`${KENTE_SERVER_URL}/api/rom-proxy?${pp}`,
-                                 { signal: _abortTimeout(PROXY_FETCH_TIMEOUT_MS) });
+        const resp = await wait(fetch(`${KENTE_SERVER_URL}/api/rom-proxy?${pp}`, { signal }));
         httpStatus = resp.status;
         if (!resp.ok)   throw new Error(await _proxyErrorTag(resp));
         if (!resp.body) throw new Error('NO_STREAM');
-        await _streamBodyInto(item, resp);
+        await _streamBodyInto(item, resp, signal);
         await _markDownloadComplete(item);
         return;
       }
@@ -269,9 +353,9 @@ const DownloadManager = (() => {
       // instead of re-querying the backend.
       if (!item._sources) {
         item.status = 'searching'; _notify();
-        item._sources   = await fetchRomSources(item.game.title && item.game.systemId
+        item._sources   = await wait(fetchRomSources(item.game.title && item.game.systemId
                                                 ? item.game.systemId : null,
-                                                item.game.title);
+                                                item.game.title));
         item._sourceIdx = item._sources?.length ? 0 : null;
       }
 
@@ -293,22 +377,21 @@ const DownloadManager = (() => {
           url: pick.url, save: '1',
           systemId: item.game.systemId, filename: pick.filename,
         });
-        const resp = await fetch(`${KENTE_SERVER_URL}/api/rom-proxy?${pp}`,
-                                 { signal: _abortTimeout(PROXY_FETCH_TIMEOUT_MS) });
+        const resp = await wait(fetch(`${KENTE_SERVER_URL}/api/rom-proxy?${pp}`, { signal }));
         httpStatus = resp.status;
         if (!resp.ok)   throw new Error(await _proxyErrorTag(resp));
         if (!resp.body) throw new Error('NO_STREAM');
-        await _streamBodyInto(item, resp);
+        await _streamBodyInto(item, resp, signal);
         await _markDownloadComplete(item);
         return;
       }
 
       // ── 1b. Legacy fallback — Archive.org subject search + pack scan ───
       item.status = 'searching'; _notify();
-      let results = await searchArchive(item.game.title, item.game.systemId);
+      let results = await wait(searchArchive(item.game.title, item.game.systemId));
 
       if (!results.length) {
-        const packs = await searchPackCollection(item.game.title, item.game.systemId);
+        const packs = await wait(searchPackCollection(item.game.title, item.game.systemId));
         const vExts = new Set((ROM_EXT[item.game.systemId] || []).map(e => e.toLowerCase()));
         const valid = packs.filter(f => {
           const ext = '.' + f.name.split('.').pop().toLowerCase();
@@ -330,7 +413,9 @@ const DownloadManager = (() => {
 
       for (const result of results.slice(0, 15)) {
         if (result._packUrl) { romUrl = result._packUrl; romFilename = result._packName; break; }
-        let files; try { files = await getArchiveFiles(result.identifier, item.game.systemId); } catch { continue; }
+        let files;
+        try { files = await wait(getArchiveFiles(result.identifier, item.game.systemId)); }
+        catch (err) { if (signal.aborted) throw err; continue; }
         const valid = files.filter(f => {
           const ext = '.' + f.name.split('.').pop().toLowerCase();
           if (!vExts.has(ext)) return false;
@@ -356,19 +441,19 @@ const DownloadManager = (() => {
       _notify();
 
       const pp   = new URLSearchParams({ url: romUrl, save: '1', systemId: item.game.systemId, filename: romFilename });
-      const resp = await fetch(`${KENTE_SERVER_URL}/api/rom-proxy?${pp}`,
-                               { signal: _abortTimeout(PROXY_FETCH_TIMEOUT_MS) });
+      const resp = await wait(fetch(`${KENTE_SERVER_URL}/api/rom-proxy?${pp}`, { signal }));
       httpStatus = resp.status;
       if (!resp.ok)   throw new Error(await _proxyErrorTag(resp));
       if (!resp.body) throw new Error('NO_STREAM');
 
-      await _streamBodyInto(item, resp);
+      await _streamBodyInto(item, resp, signal);
       await _markDownloadComplete(item);
 
     } catch (err) {
       // If item was removed by cancel() while we were awaiting, just exit
       if (!_items.find(i => i.id === item.id)) return;
       item._reader = null;
+      if (signal.aborted) err = signal.reason;
 
       const classified = _classifyError(err, httpStatus);
       if (!classified) return;   // AbortError from user cancel — item removed above handles it
@@ -386,8 +471,8 @@ const DownloadManager = (() => {
         item.error      = null;
         item.status     = 'queued';
         _notify();
-        await new Promise(r => setTimeout(r, 600));
-        if (_items.find(i => i.id === item.id)) {
+        await _pause(600, signal);
+        if (!signal.aborted && _items.includes(item)) {
           item._attempt -= 1;  // un-charge the attempt counter for this fallback
           await _download(item);
         }
@@ -404,8 +489,8 @@ const DownloadManager = (() => {
         item.status = 'queued';  // show as queued again while waiting
         item.error  = null;
         _notify();
-        await new Promise(r => setTimeout(r, wait));
-        if (_items.find(i => i.id === item.id)) await _download(item);
+        await _pause(wait, signal);
+        if (!signal.aborted && _items.includes(item)) await _download(item);
         return;
       }
 
@@ -413,14 +498,19 @@ const DownloadManager = (() => {
       item.error  = classified;
       _notify();
       console.error('[DownloadManager]', err.message, { httpStatus });
+    } finally {
+      clearTimeout(deadline);
+      if (item._controller === controller) item._controller = null;
     }
   }
 
   /* ── init: restore completed downloads from IndexedDB at boot ── */
   async function init() {
+    const completedIds = new Set();
     const saved = await DownloadDB.getAll().catch(() => []);
     saved.sort((a, b) => (b.downloadedAt || 0) - (a.downloadedAt || 0));
     for (const dl of saved) {
+      if (dl.gameId) completedIds.add(String(dl.gameId));
       if (_items.find(i => i.id === dl.id)) continue;
       _items.push({
         ...(_mkItem(dl.id, dl.game || { id: dl.gameId || dl.id, title: dl.filename,
@@ -433,6 +523,14 @@ const DownloadManager = (() => {
       });
       if (dl.gameId) ROM_STATUS[dl.gameId] = true;
     }
+    for (const game of _pendingGames()) {
+      if (completedIds.has(game.id) || _items.some(item => String(item.game?.id) === game.id)) continue;
+      const item = _mkItem(`recovered_${game.id}`, game);
+      item.status = 'error';
+      item.error = 'DOWNLOAD INTERRUPTED — SELECT RETRY TO RESUME';
+      _items.push(item);
+    }
+    _persistPending();
     _notify();
     // Background: prune OPFS-stored entries whose files have gone missing.
     // Runs after the UI is already painted so boot latency is unaffected.
@@ -447,12 +545,12 @@ const DownloadManager = (() => {
   async function _pruneStaleOpfsEntries() {
     if (!navigator?.storage?.getDirectory) return;
     let opfsRoot;
-    try { opfsRoot = await navigator.storage.getDirectory(); }
+    try { opfsRoot = await getOPFSLibrary(); }
     catch { return; }  // OPFS unavailable — skip
 
     let changed = false;
     for (const item of [..._items]) {
-      if (item.status !== 'complete' || item._storage === 'library') continue;
+      if (item.status !== 'complete' || item._storage !== 'opfs') continue;
       if (!item.game?.systemId || !item.filename) continue;
       try {
         const sysDir = await opfsRoot.getDirectoryHandle(item.game.systemId, { create: false });
@@ -473,7 +571,10 @@ const DownloadManager = (() => {
         }
       }
     }
-    if (changed) _notify();
+    if (changed) {
+      refreshGameCardDots();
+      _notify();
+    }
   }
 
   /* ── _notify: immediate HUD badge + subtitle, throttled panel render ── */

@@ -125,6 +125,9 @@ function updateIgmFocus() {
 }
 
 function showIngameMenu() {
+  NativePlayer.menu(true);
+  const badge = document.getElementById('igm-badge');
+  if (badge) badge.textContent = NativePlayer.active ? 'GAME MENU' : 'PAUSED';
   const menu = document.getElementById('ingame-menu');
   if (!menu) return;
   // Populate the title from the HUD
@@ -139,6 +142,7 @@ function showIngameMenu() {
 
 // skipStateReset = true when called from exitEmulator (we'll set state.screen = 'room' there)
 function hideIngameMenu(skipStateReset) {
+  if (!skipStateReset) NativePlayer.menu(false);
   const menu = document.getElementById('ingame-menu');
   if (!menu) return;
   menu.classList.remove('active');

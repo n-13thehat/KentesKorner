@@ -4,9 +4,9 @@ Kente's Korner — Native API Server
 Serves the web shell and bridges to Batocera's emulation stack.
 stdlib only — no pip required.
 """
-__version__ = '2.0.0'
+__version__ = '8.3.2'
 
-import hashlib, json, os, platform, re, shutil, subprocess, sys, tempfile, threading, time, zipfile
+import hashlib, json, os, platform, re, shutil, signal, subprocess, sys, tempfile, threading, time, zipfile
 import urllib.request, urllib.parse, urllib.error
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -15,6 +15,10 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from kente_security import origin_allowed as _origin_allowed_helper
 from kente_security import safe_resolve as _safe_resolve_helper
+from kente_security import public_http_url as _public_http_url
+from kente_security import safe_urlopen as _safe_urlopen
+from kente_cache import directory_usage as _directory_usage
+from kente_cache import trim_lru_cache as _trim_lru_cache
 
 # Make sibling modules importable when launched via `python kente-server.py`
 # from any cwd.
@@ -46,9 +50,18 @@ from kente_emulators import (
     _rpcs3_firmware_installed, _winget_portable_glob
 )
 from kente_ejs import _ejs_get_extracted_core, _ejs_prefetch_state, _ejs_prefetch_thread
+from kente_native_host import NativeSession
+from kente_lobby import start_lobby_relay
+from kente_runtime import (SYSTEM_ENGINES, configure_engine, configure_installed_pcsx2,
+                           configure_remote_pcsx2_player2, import_runtime, native_arguments,
+                           provision_runtime)
 from kente_mods import apply_mod, list_mods, mod_status, restore_mod
 from kente_network import _net_connect, _net_disconnect, _net_forget, _net_scan, _net_status
 from kente_boxart import _BOXART_DIR, _boxart_fetch_online
+
+_ROM_STREAM_LOCK = threading.Lock()
+_ROM_STREAM_ACTIVE = 0
+
 
 # ── Archive.org cue+bin → zip bundling ──────────────────────────────────────
 # Multi-track CD dumps on Archive.org are stored as separate files: a small
@@ -91,7 +104,7 @@ def _archive_cue_components(cue_url):
     # this stdlib-only path self-contained).
     meta_url = f'https://archive.org/metadata/{urllib.parse.quote(ident)}'
     try:
-        with urllib.request.urlopen(meta_url, timeout=12) as r:
+        with _safe_urlopen(meta_url, timeout=12) as r:
             data = json.loads(r.read().decode('utf-8', 'replace'))
     except Exception as e:
         print(f'[cue-bundle] metadata fetch failed for {ident}: {e}')
@@ -104,7 +117,7 @@ def _archive_cue_components(cue_url):
     cue_body_url = (f'https://archive.org/download/{urllib.parse.quote(ident)}/'
                     f'{urllib.parse.quote(cue_name)}')
     try:
-        with urllib.request.urlopen(cue_body_url, timeout=12) as r:
+        with _safe_urlopen(cue_body_url, timeout=12) as r:
             cue_text = r.read().decode('utf-8', 'replace')
     except Exception as e:
         print(f'[cue-bundle] cue read failed for {ident}/{cue_name}: {e}')
@@ -144,7 +157,7 @@ def _build_cue_bundle_zip(ident, cue_name, cue_text, track_names, spool_max=64*1
             req = urllib.request.Request(track_url, headers={
                 'User-Agent': 'Mozilla/5.0 (compatible; KenteKorner/1.0)',
             })
-            with urllib.request.urlopen(req, timeout=300) as resp, \
+            with _safe_urlopen(req, timeout=300) as resp, \
                  zf.open(tname, 'w', force_zip64=True) as zf_out:
                 while True:
                     chunk = resp.read(262144)
@@ -205,6 +218,8 @@ def find_rom(system_id, title):
 
     # Build search dirs without duplicates
     batocera_folder = SYSTEM_FOLDER.get(system_id)
+    if not batocera_folder:
+        return None
     dirs_to_search = []
     if batocera_folder:
         dirs_to_search.append(ROMS_DIR / batocera_folder)
@@ -212,6 +227,7 @@ def find_rom(system_id, title):
     if local_dir not in dirs_to_search:
         dirs_to_search.append(local_dir)
 
+    candidates = []
     for rom_dir in dirs_to_search:
         if not rom_dir.exists():
             continue
@@ -221,10 +237,19 @@ def find_rom(system_id, title):
             suf = f.suffix.lower()
             if suf in ('.tmp', '.part') or suf in _META_EXT:
                 continue
+            if f.stat().st_size <= 64:
+                continue
             stem = _norm_rom_key(f.stem)
-            if needle and (needle in stem or stem in needle):
-                return str(f)
-    return None
+            if roms is not None:
+                if not roms.title_matches(f.stem, title):
+                    continue
+                score = roms._title_overlap(f.stem, title)
+            elif needle and (needle in stem or stem in needle):
+                score = 1.0
+            else:
+                continue
+            candidates.append((score, f.stat().st_size, str(f)))
+    return max(candidates)[2] if candidates else None
 
 def system_info():
     """Return disk stats, Batocera version, uptime, controller count."""
@@ -329,6 +354,16 @@ def write_conf_key(key, value):
             tmp.unlink(missing_ok=True)
             raise
 
+_FLASH_CACHE_LOCK = threading.Lock()
+_FLASH_CACHE_MAX_BYTES = 2 * 1024 ** 3
+_FLASH_ASSET_MAX_BYTES = 128 * 1024 ** 2
+
+
+def _trim_flash_cache(required=0):
+    """Evict oldest cached Flash assets until there is room under the budget."""
+    _trim_lru_cache(FLASH_CACHE_DIR, required, _FLASH_CACHE_MAX_BYTES)
+
+
 def proxy_asset(url):
     """Fetch a McLeod/SSF2 asset, persist to disk cache, return (bytes, mime_type).
     Uses a 16-char SHA-256 hex prefix as the cache key so filenames stay short
@@ -346,6 +381,10 @@ def proxy_asset(url):
 
     if cache_file.exists() and meta_file.exists():
         meta = json.loads(meta_file.read_text())
+        try:
+            os.utime(cache_file, None)
+        except OSError:
+            pass
         return cache_file.read_bytes(), meta['ct']
 
     # Download from origin
@@ -353,24 +392,32 @@ def proxy_asset(url):
         'User-Agent': 'Mozilla/5.0 (compatible; KenteKorner/1.0)',
         'Referer':    'https://www.supersmashflash.com/',
     })
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with _safe_urlopen(req, timeout=30) as resp:
         ct   = resp.headers.get('Content-Type', 'application/octet-stream').split(';')[0].strip()
-        data = resp.read()
+        declared_size = int(resp.headers.get('Content-Length') or 0)
+        if declared_size > _FLASH_ASSET_MAX_BYTES:
+            raise ValueError('Flash asset exceeds the 128 MB limit')
+        data = resp.read(_FLASH_ASSET_MAX_BYTES + 1)
+        if len(data) > _FLASH_ASSET_MAX_BYTES or resp.read(1):
+            raise ValueError('Flash asset exceeds the 128 MB limit')
 
     FLASH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     # Write atomically: stage to .tmp then rename so a mid-write crash
     # never leaves a truncated file that would be served on the next request.
-    tmp_cache = cache_file.with_suffix(cache_file.suffix + '.tmp')
+    unique_tmp = f'.{threading.get_ident()}.tmp'
+    tmp_cache = cache_file.with_name(cache_file.name + unique_tmp)
     try:
-        tmp_cache.write_bytes(data)
-        tmp_cache.replace(cache_file)          # atomic on POSIX; near-atomic on Windows
+        with _FLASH_CACHE_LOCK:
+            _trim_flash_cache(len(data))
+            tmp_cache.write_bytes(data)
+            tmp_cache.replace(cache_file)      # atomic on POSIX; near-atomic on Windows
     except Exception:
         tmp_cache.unlink(missing_ok=True)      # discard incomplete temp
         raise
     # Atomic meta write — same pattern as the cache body above.
     # A partial meta.json write (e.g. server kill mid-write) would leave a
     # corrupt JSON fragment; the next request then crashes on json.loads().
-    tmp_meta = meta_file.with_suffix('.meta.json.tmp')
+    tmp_meta = meta_file.with_name(meta_file.name + unique_tmp)
     try:
         tmp_meta.write_text(json.dumps({'url': url, 'ct': ct, 'size': len(data)}))
         tmp_meta.replace(meta_file)
@@ -391,6 +438,7 @@ def flash_cache_status():
     )
     return {'files': len(meta_files), 'bytes': total_bytes,
             'ready': len(meta_files) > 0}
+
 
 def download_rom(system_id, filename, url):
     """Download a ROM from a URL directly into /userdata/roms/<system>/.
@@ -435,7 +483,10 @@ def download_rom(system_id, filename, url):
         # 30 s covers each blocking socket read; wall-clock cap below covers
         # slow-but-continuous transfers that would otherwise run for hours.
         deadline = time.monotonic() + MAX_ROM_DL_SECS
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with _safe_urlopen(req, timeout=30) as resp:
+            expected = int(resp.headers.get('Content-Length') or '0')
+            if expected < 0 or expected > MAX_ROM_FILE_BYTES:
+                raise ValueError('Invalid ROM size')
             received = 0
             chunk    = 65536  # 64 KB chunks
             with open(tmp_file, 'wb') as f:
@@ -454,6 +505,8 @@ def download_rom(system_id, filename, url):
                             f'File exceeds {MAX_ROM_FILE_BYTES // 1024**3} GB hard limit — '
                             'aborting to protect disk space'
                         )
+            if not received or (expected and received != expected):
+                raise ValueError(f'Incomplete ROM response ({received}/{expected} bytes)')
         # Atomic promotion: replace dest only after a complete write
         tmp_file.replace(dest_file)
         return True, str(dest_file), received
@@ -519,7 +572,7 @@ def launch_game(system_id, rom_path):
         proc = subprocess.Popen(
             [str(launcher), '-system', folder, '-rom', rom_path],
             env={**os.environ, 'DISPLAY': ':0'},
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         with _PROC_LOCK:
             active_proc = proc
@@ -532,12 +585,7 @@ def launch_game(system_id, rom_path):
         try:
             exit_code = proc.wait(timeout=2)
             if exit_code != 0:
-                stderr_text = ''
-                try:
-                    stderr_text = proc.stderr.read(200).decode('utf-8', errors='replace').strip()
-                except Exception:
-                    pass
-                detail = stderr_text or f'exit {exit_code}'
+                detail = f'exit {exit_code}'
                 return False, f'emulatorlauncher failed ({detail}) — check emulator install for {folder}', 'LAUNCHER_FAILED'
             # exit_code 0 in < 2 s: unusual but treat as clean handoff
         except subprocess.TimeoutExpired:
@@ -640,7 +688,7 @@ def _launch_via_wsl(linux_exe):
     except Exception as e:
         return False, str(e)
 
-def _safe_zip_extract(zip_path: Path, dest_dir: Path, max_files=5000, max_total_bytes=120 * 1024**3):
+def _safe_zip_extract(zip_path: Path, dest_dir: Path, max_files=5000, max_total_bytes=100 * 1024**3):
     """Safely extract a zip file into dest_dir (ZipSlip + basic bomb limits)."""
     import zipfile as _zf
     dest_dir = Path(dest_dir)
@@ -661,6 +709,13 @@ def _safe_zip_extract(zip_path: Path, dest_dir: Path, max_files=5000, max_total_
             total += int(getattr(info, 'file_size', 0) or 0)
             if total > max_total_bytes:
                 raise RuntimeError('Zip uncompressed size too large')
+            compressed = int(getattr(info, 'compress_size', 0) or 0)
+            expanded = int(getattr(info, 'file_size', 0) or 0)
+            if expanded > max_total_bytes or (expanded > 1024**2 and compressed > 0
+                    and expanded / compressed > 1000):
+                raise RuntimeError(f'Zip entry has an unsafe expansion ratio: {name}')
+            if len(name) > 1024:
+                raise RuntimeError('Zip entry path is too long')
             # Zip uses forward slashes; os.path handles it fine on Windows.
             out_path = os.path.abspath(os.path.join(dest_abs, name))
             if os.path.commonpath([dest_abs, out_path]) != dest_abs:
@@ -695,17 +750,46 @@ def _extract_rom_container(system_id: str, rom_file: Path) -> Path:
 
     ext = rom_file.suffix.lower()
     if ext == '.zip':
-        _safe_zip_extract(rom_file, dest)
-    elif ext == '.7z':
-        tar = shutil.which('tar')
-        if not tar:
-            raise RuntimeError('tar not available for .7z extraction')
-        r = subprocess.run([tar, '-xf', str(rom_file), '-C', str(dest)],
-                           capture_output=True, text=True, timeout=60 * 60)
-        if r.returncode != 0:
-            raise RuntimeError((r.stdout + r.stderr).strip()[:500] or f'tar exit {r.returncode}')
-    else:
-        raise RuntimeError(f'Unsupported ROM container type: {rom_file.name}')
+        # ROM downloads may be highly compressed: this NBA Street archive is
+        # 1.3 GB on disk but expands to a 4.1 GB ISO. Check the destination
+        # volume before extraction so the emulator never receives a truncated
+        # image after the drive fills up.
+        try:
+            with zipfile.ZipFile(str(rom_file)) as zf:
+                required_bytes = sum(int(info.file_size or 0) for info in zf.infolist()
+                                     if info.filename and not info.filename.endswith('/'))
+        except Exception as exc:
+            shutil.rmtree(dest, ignore_errors=True)
+            raise RuntimeError(f'Could not read ROM archive: {exc}')
+        free_bytes = shutil.disk_usage(str(ROMS_DIR)).free
+        reserve_bytes = 128 * 1024 * 1024
+        if free_bytes < required_bytes + reserve_bytes:
+            shutil.rmtree(dest, ignore_errors=True)
+            need_gb = (required_bytes + reserve_bytes) / (1024 ** 3)
+            free_gb = free_bytes / (1024 ** 3)
+            raise RuntimeError(
+                f'Not enough free disk space to extract this game. '
+                f'It needs about {need_gb:.1f} GB free; only {free_gb:.1f} GB is available. '
+                f'Free disk space and try again.'
+            )
+    try:
+        if ext == '.zip':
+            _safe_zip_extract(rom_file, dest)
+        elif ext in ('.7z', '.rar'):
+            tar = shutil.which('tar')
+            if not tar:
+                raise RuntimeError(f'tar not available for {ext} extraction')
+            r = subprocess.run([tar, '-xf', str(rom_file), '-C', str(dest)],
+                               capture_output=True, text=True, timeout=60 * 60)
+            if r.returncode != 0:
+                raise RuntimeError((r.stdout + r.stderr).strip()[:500] or f'tar exit {r.returncode}')
+        else:
+            raise RuntimeError(f'Unsupported ROM container type: {rom_file.name}')
+    except Exception:
+        # Never leave a partial ISO in the extraction cache. A subsequent
+        # launch can retry cleanly after the user frees disk space.
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
 
     # Pick the best inner payload for the system. The preference tuple is
     # ranked best-first; a smaller rank wins, with file size as the tie-break
@@ -838,7 +922,7 @@ def find_and_launch_rom(system_id, rom_path):
     # If the ROM is in an archive container, extract to a cache dir and launch
     # the inner file/folder instead (many native emulators cannot boot .zip/.7z).
     try:
-        if rom.is_file() and rom.suffix.lower() in ('.zip', '.7z'):
+        if rom.is_file() and rom.suffix.lower() in ('.zip', '.7z', '.rar'):
             rom = _extract_rom_container(system_id, rom)
     except Exception as _ex:
         return False, '', 'EXTRACT_FAILED', f'Failed to extract ROM archive: {_ex}'
@@ -890,6 +974,11 @@ def find_and_launch_rom(system_id, rom_path):
         # Prefer portable mode for user-space PCSX2 installs so BIOS/config stays
         # self-contained under %LOCALAPPDATA%\\Programs\\PCSX2.
         if key == 'pcsx2-qt':
+            try:
+                configure_installed_pcsx2(exe_str)
+            except Exception as ex:
+                # Input setup must never block an otherwise valid game launch.
+                print(f'[controller] PCSX2 input setup skipped: {ex}')
             try:
                 exe_p = Path(exe_str)
                 localapp = os.environ.get('LOCALAPPDATA', '')
@@ -1011,19 +1100,179 @@ def find_and_launch_rom(system_id, rom_path):
     # or fall back to "open folder" based on platform/mode.
     return False, '', 'NO_EMULATOR', f'No emulator found for {system_id} — install required'
 
+_native_session = None
+_NATIVE_LOCK = threading.RLock()
+_NATIVE_CANCELLED = {}
+
+
+def start_native_player(body):
+    """Launch an app-owned engine, then attach its game surface to Electron."""
+    global _native_session, active_proc
+    if not IS_APP or platform.system() != 'Windows':
+        return {'success': False, 'error': 'NATIVE_UNAVAILABLE', 'message': 'Use the Windows desktop app for this system.'}
+    sid = body.get('systemId', '')
+    engine = SYSTEM_ENGINES.get(sid)
+    if not engine:
+        return {'success': False, 'error': 'UNKNOWN_SYSTEM', 'message': 'No native engine is configured for this system.'}
+    with _NATIVE_LOCK:
+        requested_id = str((body.get('host') or {}).get('sessionId') or '')[:128]
+        if requested_id and requested_id in _NATIVE_CANCELLED:
+            return {'success': False, 'error': 'CANCELLED', 'message': 'Game launch cancelled.'}
+        if _native_session and not _native_session.cancelled.is_set():
+            previous = _native_session.proc
+            if previous is None or previous.poll() is None:
+                return {'success': False, 'error': 'NATIVE_BUSY', 'message': 'Close the current game before starting another.'}
+            _native_session.stop()  # Restore temporary PS2 Player 2 bindings before replacing the session.
+        try:
+            session = NativeSession(body.get('host') or {}, engine)
+        except (ValueError, RuntimeError) as error:
+            return {'success': False, 'error': 'INVALID_NATIVE_HOST', 'message': str(error)}
+        _native_session = session
+    try:
+        title = body.get('title', '')
+        filename = body.get('filename')
+        if not isinstance(title, str) or (filename is not None and (not isinstance(filename, str)
+                or not filename or any(char in filename for char in ('/', '\\', ':', '\x00')) or filename in ('.', '..'))):
+            raise ValueError('Invalid game title or filename')
+        if filename:
+            folder = SYSTEM_FOLDER.get(sid)
+            rom = ROMS_DIR / folder / filename
+            if not rom.is_file():
+                rom = None
+        else:
+            found = find_rom(sid, title)
+            rom = Path(found) if found else None
+        if not rom:
+            session.stop()
+            return {'success': False, 'error': 'ROM_NOT_FOUND', 'message': 'Add this game to your local library or download it in Kente.'}
+        installed = next((os.path.expandvars(path) for path in NATIVE_EMU_WIN.get(sid, [])
+                          if Path(os.path.expandvars(path)).is_file()), None)
+        exe = provision_runtime(engine, installed)
+        if not exe:
+            session.stop()
+            return {'success': False, 'error': 'NO_EMULATOR', 'engine': engine, 'message': 'This game engine needs to be added to Kente.'}
+        configure_engine(engine, exe, embedded=True)
+        if body.get('remotePlayer2') is True and engine == 'pcsx2':
+            session.remote_pad_config = Path(exe).parent / 'inis/PCSX2.ini'
+            session.remote_pad_backup = configure_remote_pcsx2_player2(session.remote_pad_config)
+        if sid == 'ps3' and not _rpcs3_firmware_installed(str(exe)):
+            session.stop()
+            return {'success': False, 'error': 'PS3_FIRMWARE_MISSING', 'engine': engine,
+                    'message': 'Install PlayStation 3 firmware in Sources before playing.'}
+        if rom.suffix.lower() in ('.zip', '.7z', '.rar'):
+            rom = _extract_rom_container(sid, rom)
+        if session.cancelled.is_set():
+            return {'success': False, 'error': 'CANCELLED', 'message': 'Game launch cancelled.'}
+        startup = subprocess.STARTUPINFO()
+        startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startup.wShowWindow = 0
+        proc = subprocess.Popen([str(exe)] + native_arguments(engine, exe, rom, embedded=True),
+                                cwd=str(exe.parent), startupinfo=startup, close_fds=True)
+        with _PROC_LOCK:
+            active_proc = proc
+        session.attach(proc)
+        def wait_for_game():
+            global active_proc
+            proc.wait()
+            with _PROC_LOCK:
+                if active_proc is proc:
+                    active_proc = None
+        threading.Thread(target=wait_for_game, daemon=True).start()
+        return {'success': True, 'embedded': True, 'engine': engine, 'pid': proc.pid}
+    except Exception as error:
+        session.error = str(error)
+        session.stop()
+        message = str(error)
+        return {'success': False, 'error': 'PS2_BIOS_MISSING' if message.startswith('PS2_BIOS_MISSING:') else 'NATIVE_START_FAILED',
+                'message': message}
+
+
 # ── Request Handler ───────────────────────────────────────────────────────────
 
 class KenteHandler(BaseHTTPRequestHandler):
-    def log_message(self, *_): pass  # silence access log
+    def log_message(self, fmt, *args):
+        # Optional access diagnostics omit query strings, which may contain
+        # signed media URLs or provider tokens.
+        if os.getenv('KENTE_ACCESS_LOG') == '1':
+            safe_path = ''.join(ch for ch in self.path.split('?', 1)[0][:200]
+                                if ch.isprintable())
+            sys.stderr.write('[http] %s %s %s %s\n' % (
+                self.client_address[0], self.command or '-',
+                safe_path, args[0] if args else '-'))
 
     def send_json(self, data, status=200):
         body = json.dumps(data).encode()
         self.send_response(status)
         self.send_header('Content-Type', 'application/json')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Cache-Control', 'no-store')
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Content-Length', len(body))
         self.end_headers()
         self.wfile.write(body)
+
+    def _stream_rom(self, source, dest_file, content_type, content_length=None):
+        """Stream a ROM with bounded memory; publish disk saves only at EOF."""
+        global _ROM_STREAM_ACTIVE
+        expected = int(content_length) if content_length not in (None, '') else None
+        if expected is not None and (expected <= 0 or expected > MAX_ROM_FILE_BYTES):
+            raise ValueError('Invalid ROM size')
+        output = None
+        temp_path = None
+        tracked = False
+        deadline = time.monotonic() + MAX_ROM_DL_SECS
+        try:
+            # Keep one chunk back so the client only sees a complete response
+            # after the saved file has been closed and atomically promoted.
+            pending = source.read(262144)
+            if not pending:
+                raise ValueError('Empty ROM response')
+            if dest_file:
+                output = tempfile.NamedTemporaryFile(mode='wb', dir=dest_file.parent,
+                                                     prefix='.kente-', suffix='.part', delete=False)
+                temp_path = Path(output.name)
+            self.send_response(200)
+            self.send_header('Content-Type', content_type)
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Access-Control-Expose-Headers', 'X-Kente-Saved-Path')
+            if expected is not None:
+                self.send_header('Content-Length', str(expected))
+            if dest_file:
+                self.send_header('X-Kente-Saved-Path', str(dest_file))
+            self.end_headers()
+            self._rom_stream_started = True
+            with _ROM_STREAM_LOCK:
+                _ROM_STREAM_ACTIVE += 1
+            tracked = True
+
+            received = 0
+            while pending:
+                received += len(pending)
+                if received > MAX_ROM_FILE_BYTES or (expected is not None and received > expected):
+                    raise ValueError('ROM exceeds expected size')
+                if time.monotonic() > deadline:
+                    raise TimeoutError('ROM download exceeded time limit')
+                if output:
+                    output.write(pending)
+                chunk = source.read(262144)
+                if not chunk:
+                    break
+                self.wfile.write(pending)
+                pending = chunk
+            if expected is not None and received != expected:
+                raise ValueError(f'Incomplete ROM response ({received}/{expected} bytes)')
+            if output:
+                output.close()
+                temp_path.replace(dest_file)
+            self.wfile.write(pending)
+        finally:
+            if output:
+                output.close()
+            if temp_path:
+                temp_path.unlink(missing_ok=True)
+            if tracked:
+                with _ROM_STREAM_LOCK:
+                    _ROM_STREAM_ACTIVE = max(0, _ROM_STREAM_ACTIVE - 1)
 
     def serve_static(self, url_path):
         if url_path in ('', '/'):
@@ -1033,13 +1282,24 @@ class KenteHandler(BaseHTTPRequestHandler):
         fpath = _safe_resolve_helper(WEB_DIR, url_path)
         if fpath is None:
             self.send_response(403); self.end_headers(); return
+        # WEB_DIR is the repository in development. Serve only the public web
+        # assets, never credentials, source files, ROMs, or repository metadata.
+        relative = fpath.relative_to(WEB_DIR.resolve())
+        public_files = {'index.html', 'style.css', 'library.js'}
+        public_dirs = {'js', 'vendor', 'games', 'boxart', 'Conceptual Artifacts'}
+        if (any(part.startswith('.') for part in relative.parts)
+                or not relative.parts
+                or (relative.as_posix() not in public_files
+                    and relative.parts[0] not in public_dirs)):
+            self.send_response(403); self.end_headers(); return
         if not fpath.exists() or not fpath.is_file():
             self.send_response(404); self.end_headers(); return
-        data = fpath.read_bytes()
+        size = fpath.stat().st_size
         self.send_response(200)
         self.send_header('Content-Type', MIME.get(fpath.suffix.lower(), 'application/octet-stream'))
         self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Content-Length', len(data))
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Content-Length', str(size))
         # HTML/JS/CSS must never be served from the browser disk cache: when
         # we ship a frontend JS fix, the renderer has to see it on the next
         # reload, not a stale Chromium-cached copy. Other asset types keep
@@ -1047,7 +1307,19 @@ class KenteHandler(BaseHTTPRequestHandler):
         if fpath.suffix.lower() in ('.html', '.js', '.css'):
             self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
         self.end_headers()
-        self.wfile.write(data)
+        with fpath.open('rb') as source:
+            shutil.copyfileobj(source, self.wfile, 256 * 1024)
+
+    def _send_file(self, path, content_type):
+        """Stream a trusted local asset without buffering the complete file."""
+        size = path.stat().st_size
+        self.send_response(200)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Content-Length', str(size))
+        self.end_headers()
+        with path.open('rb') as source:
+            shutil.copyfileobj(source, self.wfile, 256 * 1024)
 
     def _serve_ejs(self, subpath):
         """Serve EmulatorJS assets:
@@ -1062,13 +1334,7 @@ class KenteHandler(BaseHTTPRequestHandler):
         if stable_path is None:
             self.send_response(403); self.end_headers(); return
         if stable_path.exists() and stable_path.is_file():
-            data = stable_path.read_bytes()
-            self.send_response(200)
-            self.send_header('Content-Type', MIME.get(stable_path.suffix.lower(), 'application/octet-stream'))
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.send_header('Content-Length', str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+            self._send_file(stable_path, MIME.get(stable_path.suffix.lower(), 'application/octet-stream'))
             return
 
         # 1b) Serve from packaged seed pack (WEB_DIR/cache/ejs-stable) when present.
@@ -1078,23 +1344,17 @@ class KenteHandler(BaseHTTPRequestHandler):
             if EJS_SEED_DIR.exists():
                 seed_path = _safe_resolve_helper(EJS_SEED_DIR, '/' + (subpath or ''))
                 if seed_path is not None and seed_path.exists() and seed_path.is_file():
-                    data = seed_path.read_bytes()
                     # Best-effort: write-through into user cache so subsequent loads
                     # continue to work even if WEB_DIR is moved/removed.
                     try:
                         EJS_STABLE_DIR.mkdir(parents=True, exist_ok=True)
                         stable_path.parent.mkdir(parents=True, exist_ok=True)
                         tmp = stable_path.with_name(stable_path.name + '.tmp')
-                        tmp.write_bytes(data)
+                        shutil.copyfile(seed_path, tmp)
                         tmp.replace(stable_path)
                     except Exception:
                         pass
-                    self.send_response(200)
-                    self.send_header('Content-Type', MIME.get(seed_path.suffix.lower(), 'application/octet-stream'))
-                    self.send_header('Access-Control-Allow-Origin', '*')
-                    self.send_header('Content-Length', str(len(data)))
-                    self.end_headers()
-                    self.wfile.write(data)
+                    self._send_file(seed_path, MIME.get(seed_path.suffix.lower(), 'application/octet-stream'))
                     return
         except Exception:
             pass
@@ -1110,7 +1370,7 @@ class KenteHandler(BaseHTTPRequestHandler):
                     EJS_CORES_DIR.mkdir(parents=True, exist_ok=True)
                     req = urllib.request.Request(
                         dl_url, headers={'User-Agent': 'KenteKorner/1.0'})
-                    with urllib.request.urlopen(req, timeout=120) as resp:
+                    with _safe_urlopen(req, timeout=120) as resp:
                         data = resp.read()
                     tmp = cached.with_suffix('.tmp')
                     tmp.write_bytes(data)
@@ -1119,13 +1379,7 @@ class KenteHandler(BaseHTTPRequestHandler):
                 except Exception as e:
                     print(f'[ejs-core] Download failed: {e}')
                     self.send_response(502); self.end_headers(); return
-            data = cached.read_bytes()
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/octet-stream')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.send_header('Content-Length', str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+            self._send_file(cached, 'application/octet-stream')
             return
 
         # Proxy everything else to the stable CDN
@@ -1133,7 +1387,7 @@ class KenteHandler(BaseHTTPRequestHandler):
         try:
             req = urllib.request.Request(
                 cdn_url, headers={'User-Agent': 'KenteKorner/1.0'})
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            with _safe_urlopen(req, timeout=60) as resp:
                 ct   = resp.headers.get('Content-Type', 'application/octet-stream')
                 data = resp.read()
             # Skip write-through for empty/zero-byte responses (defensive).
@@ -1196,13 +1450,18 @@ class KenteHandler(BaseHTTPRequestHandler):
     #      come back through this same endpoint
     # Image responses are also served through here so posters display under
     # any browser referrer policy.
-    _HLS_LINE_RE = re.compile(r'^(URI=")([^"]+)(")', re.M)
+    _HLS_LINE_RE = re.compile(r'(\bURI=")([^"]+)(")')
 
     def _serve_theater_proxy(self, target_url):
         if not target_url:
             self.send_json({'error': 'Missing url'}, 400); return
+        started = False
         try:
-            target_url = urllib.parse.unquote(target_url)
+            # parse_qs already decoded the outer query parameter. Another
+            # unquote would corrupt escaped paths and signed CDN tokens.
+            parsed = urllib.parse.urlparse(target_url)
+            if not _public_http_url(target_url):
+                self.send_json({'error': 'URL must resolve to a public HTTP(S) address'}, 400); return
             req_headers = {
                 'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                                'AppleWebKit/537.36 (KHTML, like Gecko) '
@@ -1214,62 +1473,83 @@ class KenteHandler(BaseHTTPRequestHandler):
             }
             # Pass a Referer matching the upstream origin so CDNs that hot-link-
             # protect against random referers will still serve the asset.
-            parsed = urllib.parse.urlparse(target_url)
             req_headers['Referer'] = f'{parsed.scheme}://{parsed.netloc}/'
             rng = self.headers.get('Range')
             if rng: req_headers['Range'] = rng
             req = urllib.request.Request(target_url, headers=req_headers)
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with _safe_urlopen(req, timeout=30) as resp:
                 ct   = resp.headers.get('Content-Type', 'application/octet-stream')
                 ce   = (resp.headers.get('Content-Encoding') or '').lower()
-                data = resp.read()
+                # Resolve relative playlist links against the final CDN URL,
+                # since a redirect may move the manifest into another folder.
+                final_url = resp.geturl()
+                data = resp.read(65536)
                 status = resp.status
                 ar = resp.headers.get('Accept-Ranges')
                 cr = resp.headers.get('Content-Range')
+                is_m3u8 = (
+                    'mpegurl' in ct.lower()
+                    or urllib.parse.urlparse(final_url).path.lower().endswith('.m3u8')
+                    or data.startswith((b'#EXTM3U', b'\xef\xbb\xbf#EXTM3U'))
+                )
+                if is_m3u8:
+                    # Buffer only playlists, never a complete movie or segment.
+                    # Reject oversized manifests instead of exhausting RAM.
+                    limit = 8 * 1024 * 1024
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        data += chunk
+                        if len(data) > limit:
+                            raise ValueError('HLS playlist too large')
+                    if ce == 'gzip':
+                        import gzip, io
+                        with gzip.GzipFile(fileobj=io.BytesIO(data)) as compressed:
+                            data = compressed.read(limit + 1)
+                    elif ce == 'deflate':
+                        import zlib
+                        try:
+                            data = zlib.decompressobj().decompress(data, limit + 1)
+                        except zlib.error:
+                            data = zlib.decompressobj(-zlib.MAX_WBITS).decompress(data, limit + 1)
+                    elif ce not in ('', 'identity'):
+                        raise ValueError('Unsupported HLS content encoding')
+                    if len(data) > limit:
+                        raise ValueError('HLS playlist too large')
+                    text = data.decode('utf-8-sig')
+                    if not text.startswith('#EXTM3U'):
+                        raise ValueError('Invalid HLS playlist')
+                    data = self._rewrite_hls(text, final_url).encode('utf-8')
+                    ct, ce = 'application/vnd.apple.mpegurl', ''
+                    status, ar, cr = 200, None, None
 
-            # Some CDNs ignore Accept-Encoding: identity and still send gzip.
-            if ce == 'gzip':
-                import gzip as _gz
-                try: data = _gz.decompress(data)
-                except Exception: pass
-            elif ce in ('deflate', 'br'):
-                try:
-                    if ce == 'deflate':
-                        import zlib as _zl
-                        data = _zl.decompress(data)
-                except Exception: pass
-
-            # Rewrite HLS playlists so segment / key / media URIs route back
-            # through this proxy.
-            is_m3u8 = (
-                ('mpegurl' in ct.lower())
-                or target_url.lower().split('?', 1)[0].endswith('.m3u8')
-                or data[:7] == b'#EXTM3U'
-            )
-            if is_m3u8 and data[:7] == b'#EXTM3U':
-                try:
-                    text = data.decode('utf-8', 'ignore')
-                    text = self._rewrite_hls(text, target_url)
-                    data = text.encode('utf-8')
-                    ct = 'application/vnd.apple.mpegurl'
-                except Exception as _e:
-                    print(f'[theater-proxy] m3u8 rewrite failed: {_e}')
-
-            self.send_response(status)
-            self.send_header('Content-Type', ct)
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.send_header('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges')
-            if ar: self.send_header('Accept-Ranges', ar)
-            if cr: self.send_header('Content-Range', cr)
-            self.send_header('Content-Length', str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+                self.send_response(status)
+                self.send_header('Content-Type', ct)
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.send_header('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges')
+                if ar: self.send_header('Accept-Ranges', ar)
+                if cr: self.send_header('Content-Range', cr)
+                if ce: self.send_header('Content-Encoding', ce)
+                length = str(len(data)) if is_m3u8 else resp.headers.get('Content-Length')
+                if length is not None: self.send_header('Content-Length', length)
+                self.end_headers()
+                started = True
+                self.wfile.write(data)
+                if not is_m3u8:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
         except urllib.error.HTTPError as e:
             print(f'[theater-proxy] HTTP {e.code} for {target_url[:120]}')
-            self.send_response(e.code); self.end_headers()
+            if not started:
+                self.send_response(e.code); self.end_headers()
         except Exception as e:
             print(f'[theater-proxy] {target_url[:120]} -> {e}')
-            self.send_response(502); self.end_headers()
+            if not started:
+                self.send_response(502); self.end_headers()
 
     def _rewrite_hls(self, text, base_url):
         """Rewrite every segment / key / media URI in an HLS playlist to be
@@ -1304,6 +1584,12 @@ class KenteHandler(BaseHTTPRequestHandler):
         path = self.path.split('?')[0]
         # Parse query string once so all branches can use qs.get(...)
         qs = urllib.parse.parse_qs(self.path.split('?', 1)[1] if '?' in self.path else '')
+        # GET routes can launch OS UI, stop games, clear caches, and save ROMs.
+        # Apply the same browser-origin policy as POST before any API action.
+        # The public health check remains usable by the file-based kiosk splash.
+        if path.startswith('/api/') and path != '/api/ping' and not self._origin_allowed():
+            self.send_json({'error': 'Origin not allowed'}, 403)
+            return
         if path == '/api/ping':
             self.send_json({
                 'status':  'ok',
@@ -1382,6 +1668,20 @@ class KenteHandler(BaseHTTPRequestHandler):
 
         elif path == '/api/bios/status':
             self.send_json(bios_status())
+        elif path == '/api/bios/file':
+            sid = qs.get('systemId', [''])[0]
+            filename = BIOS_FILES.get(sid)
+            target = BIOS_DIR / filename if filename else None
+            if not target or not target.is_file():
+                self.send_json({'error': 'BIOS not present'}, 404)
+                return
+            data = target.read_bytes()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/octet-stream')
+            self.send_header('Content-Length', str(len(data)))
+            self.send_header('X-Kente-Filename', filename)
+            self.end_headers()
+            self.wfile.write(data)
         elif path == '/api/bios/download/status':
             self.send_json(dict(_bios_dl_state))
         elif path == '/api/emulators/status':
@@ -1398,6 +1698,31 @@ class KenteHandler(BaseHTTPRequestHandler):
             self.send_json(dict(_ejs_prefetch_state))
         elif path == '/api/system/info':
             self.send_json(system_info())
+        elif path == '/api/diagnostics':
+            with _DOWNLOAD_LOCK:
+                active_downloads = len(_active_downloads)
+            with _ROM_STREAM_LOCK:
+                active_downloads += _ROM_STREAM_ACTIVE
+            semaphore = getattr(self.server, '_worker_slots', None)
+            free_slots = getattr(semaphore, '_value', None)
+            max_requests = getattr(self.server, 'max_workers', 32)
+            diagnostics = {
+                'version': __version__,
+                'mode': 'electron' if IS_APP else ('batocera' if IS_BATOCERA else 'browser'),
+                'server': {'activeRequests': max_requests - free_slots if free_slots is not None else None,
+                           'maxRequests': max_requests},
+                'downloads': {'active': active_downloads},
+                'providers': {
+                    'rom': sorted((roms.PROVIDERS if roms else {}).keys()),
+                    'theater': sorted((theater.PROVIDERS if theater else {}).keys()),
+                },
+                'cache': {
+                    'flash': _directory_usage(FLASH_CACHE_DIR),
+                    'emulatorCores': _directory_usage(EJS_CORES_DIR),
+                    'emulatorAssets': _directory_usage(EJS_STABLE_DIR),
+                },
+            }
+            self.send_json(diagnostics)
         elif path == '/api/saves':
             self.send_json(list_saves())
         elif path == '/api/sources':
@@ -1485,55 +1810,27 @@ class KenteHandler(BaseHTTPRequestHandler):
                 dest_dir = ROMS_DIR / folder
                 dest_dir.mkdir(parents=True, exist_ok=True)
                 candidate = dest_dir / safe_fname
-                # Serialise concurrent saves of the same file — prevents two requests
-                # from both opening the file in 'wb' mode and truncating each other.
-                with _DOWNLOAD_LOCK:
-                    if str(candidate) in _active_downloads:
-                        # Already in progress — stream-only, don't save again.
-                        pass
-                    elif not candidate.exists():
-                        _active_downloads.add(str(candidate))
-                        dest_file = candidate
+                # Each response writes to its own temporary file. This also lets
+                # a replacement source save while a canceled connection unwinds;
+                # sharing a reservation would silently make that retry stream-only.
+                if not candidate.exists():
+                    dest_file = candidate
 
             # ── Bundle path: archive.org .cue + sibling .bin → synthetic zip ──
+            self._rom_stream_started = False
             if bundle_info:
                 ident, cue_name, tracks, cue_text = bundle_info
                 print(f'[ROM Proxy/bundle] {ident}: {cue_name} + {len(tracks)} track(s)')
                 try:
-                    spool = _build_cue_bundle_zip(ident, cue_name, cue_text, tracks)
-                    spool.seek(0, 2)
-                    total = spool.tell()
-                    spool.seek(0)
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'application/zip')
-                    self.send_header('Content-Length', str(total))
-                    self.send_header('Access-Control-Allow-Origin', '*')
-                    self.send_header('Access-Control-Expose-Headers', 'X-Kente-Saved-Path')
-                    if dest_file:
-                        self.send_header('X-Kente-Saved-Path', str(dest_file))
-                    self.end_headers()
-                    f_out = open(dest_file, 'wb') if dest_file else None
-                    try:
-                        while True:
-                            chunk = spool.read(262144)
-                            if not chunk: break
-                            self.wfile.write(chunk)
-                            if f_out: f_out.write(chunk)
-                    finally:
-                        if f_out: f_out.close()
-                        try: spool.close()
-                        except Exception: pass
-                        if dest_file:
-                            with _DOWNLOAD_LOCK:
-                                _active_downloads.discard(str(dest_file))
+                    with _build_cue_bundle_zip(ident, cue_name, cue_text, tracks) as spool:
+                        spool.seek(0, 2)
+                        total = spool.tell()
+                        spool.seek(0)
+                        self._stream_rom(spool, dest_file, 'application/zip', total)
                 except Exception as e:
                     print(f'[ROM Proxy/bundle] failed: {type(e).__name__}: {e}')
-                    if dest_file:
-                        try:
-                            if dest_file.exists(): dest_file.unlink()
-                        except Exception: pass
-                        with _DOWNLOAD_LOCK:
-                            _active_downloads.discard(str(dest_file))
+                    if self._rom_stream_started:
+                        return
                     try:
                         self.send_json({
                             'error': f'cue+bin bundling failed: {type(e).__name__}',
@@ -1550,46 +1847,10 @@ class KenteHandler(BaseHTTPRequestHandler):
                 _ref = _rom_upstream_referer(host)
                 if _ref: hdrs['Referer'] = _ref
                 req = urllib.request.Request(url, headers=hdrs)
-                with urllib.request.urlopen(req, timeout=300) as resp:
+                with _safe_urlopen(req, timeout=300) as resp:
                     ct = resp.headers.get('Content-Type', 'application/octet-stream')
                     cl = resp.headers.get('Content-Length', '')
-                    self.send_response(200)
-                    self.send_header('Content-Type', ct)
-                    self.send_header('Access-Control-Allow-Origin', '*')
-                    self.send_header('Access-Control-Expose-Headers', 'X-Kente-Saved-Path')
-                    if cl:
-                        self.send_header('Content-Length', cl)
-                    if dest_file:
-                        self.send_header('X-Kente-Saved-Path', str(dest_file))
-                    self.end_headers()
-
-                    f_out = open(dest_file, 'wb') if dest_file else None
-                    try:
-                        # Larger chunks reduce Python overhead and generally improve
-                        # throughput for large ROM/ISO transfers.
-                        while True:
-                            chunk = resp.read(262144)
-                            if not chunk:
-                                break
-                            self.wfile.write(chunk)
-                            if f_out:
-                                f_out.write(chunk)
-                    except Exception:
-                        # Partial transfer — remove incomplete file so polling
-                        # never mistakes a fragment for a complete ROM.
-                        if f_out:
-                            f_out.close()
-                            f_out = None
-                        if dest_file and dest_file.exists():
-                            dest_file.unlink()
-                        raise
-                    finally:
-                        if f_out:
-                            f_out.close()
-                        # Release the concurrency lock regardless of success/failure.
-                        if dest_file:
-                            with _DOWNLOAD_LOCK:
-                                _active_downloads.discard(str(dest_file))
+                    self._stream_rom(resp, dest_file, ct, cl)
 
             except urllib.error.HTTPError as e:
                 # Forward the upstream status verbatim so the UI can show
@@ -1597,6 +1858,8 @@ class KenteHandler(BaseHTTPRequestHandler):
                 # Common: archive.org returns 503 when load-balancers throttle,
                 # 500 when a CDN node is broken for a specific item.
                 print(f'[ROM Proxy] upstream {e.code} for {host}: {e.reason}')
+                if self._rom_stream_started:
+                    return
                 try:
                     self.send_json({
                         'error':         f'Upstream {e.code} {e.reason}',
@@ -1610,6 +1873,8 @@ class KenteHandler(BaseHTTPRequestHandler):
                 # DNS / connection refused / TLS handshake — distinct signal
                 # from "upstream returned an HTTP error".
                 print(f'[ROM Proxy] network error for {host}: {e}')
+                if self._rom_stream_started:
+                    return
                 try:
                     self.send_json({
                         'error':       f'Network error reaching {host}',
@@ -1620,6 +1885,10 @@ class KenteHandler(BaseHTTPRequestHandler):
                     pass
             except Exception as e:
                 print(f'[ROM Proxy] {type(e).__name__}: {e}')
+                # An interrupted body must end at EOF. A second HTTP response
+                # here would be appended to the ROM and corrupt the download.
+                if self._rom_stream_started:
+                    return
                 try:
                     self.send_json({
                         'error': f'ROM proxy failed: {type(e).__name__}',
@@ -1649,7 +1918,7 @@ class KenteHandler(BaseHTTPRequestHandler):
                     meta_url,
                     headers={'User-Agent': 'KenteKorner/1.0', 'Accept': 'application/json'},
                 )
-                with urllib.request.urlopen(req, timeout=20) as resp:
+                with _safe_urlopen(req, timeout=20) as resp:
                     data = json.loads(resp.read())
             except Exception as e:
                 print(f'[pack/search] {e}')
@@ -1730,7 +1999,47 @@ class KenteHandler(BaseHTTPRequestHandler):
                 'sizeBytes': size,
                 'path':      str(target) if exists else None,
             })
+        elif path == '/api/rom/resolve':
+            sid = qs.get('systemId', [''])[0]
+            title = qs.get('title', [''])[0]
+            if sid not in SYSTEM_FOLDER or not title:
+                self.send_json({'error': 'Invalid systemId or title'}, 400); return
+            found = find_rom(sid, title)
+            if not found:
+                self.send_json({'found': False}); return
+            target = Path(found)
+            params = urllib.parse.urlencode({'systemId': sid, 'filename': target.name,
+                                              'folder': target.parent.name})
+            self.send_json({'found': True, 'filename': target.name,
+                            'sizeBytes': target.stat().st_size, 'url': '/api/rom/file?' + params})
+        elif path == '/api/rom/file':
+            sid = qs.get('systemId', [''])[0]
+            fname = qs.get('filename', [''])[0]
+            folder = qs.get('folder', [SYSTEM_FOLDER.get(sid, '')])[0]
+            if (sid not in SYSTEM_FOLDER or folder not in (sid, SYSTEM_FOLDER[sid])
+                    or not fname or fname in ('.', '..')
+                    or any(c in fname for c in ('/', '\\', ':', '\x00'))):
+                self.send_json({'error': 'Invalid ROM path'}, 400); return
+            base = (ROMS_DIR / folder).resolve()
+            target = (base / fname).resolve()
+            try:
+                target.relative_to(base)
+            except ValueError:
+                self.send_json({'error': 'ROM outside system folder'}, 403); return
+            if not target.is_file():
+                self.send_json({'error': 'ROM not found'}, 404); return
+            self._rom_stream_started = False
+            try:
+                with target.open('rb') as source:
+                    self._stream_rom(source, None, 'application/octet-stream', target.stat().st_size)
+            except (OSError, ValueError) as error:
+                if not self._rom_stream_started:
+                    self.send_json({'error': str(error)}, 500)
         # ─────────────────────────────────────────────────────────────────────
+
+        elif path == '/api/native/status':
+            self.send_json(_native_session.status() if _native_session else
+                           {'running': False, 'embedded': False, 'pid': None})
 
         elif path == '/api/app/status':
             with _PROC_LOCK:
@@ -2006,16 +2315,26 @@ class KenteHandler(BaseHTTPRequestHandler):
             self.serve_static(path)
 
     def _origin_allowed(self):
-        # CSRF guard delegated to kente_security so it can be unit-tested in
-        # isolation.  Policy lives there; this method just supplies the header.
-        return _origin_allowed_helper(self.headers.get('Origin', ''))
+        origin = self.headers.get('Origin', '')
+        if origin:
+            return _origin_allowed_helper(origin)
+        # Images and top-level navigations can omit Origin. Fetch Metadata
+        # still identifies attempts from an unrelated website on modern browsers.
+        return self.headers.get('Sec-Fetch-Site', '').lower() != 'cross-site'
 
     def do_POST(self):
+        global active_proc
         if not self._origin_allowed():
             self.send_json({'error': 'Origin not allowed'}, 403)
             return
         path   = self.path.split('?')[0]
-        length = int(self.headers.get('Content-Length', 0))
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+            if length < 0:
+                raise ValueError('Negative Content-Length')
+        except ValueError:
+            self.send_json({'error': 'Invalid Content-Length'}, 400)
+            return
         if length > 10 * 1024 * 1024:
             self.send_json({'error': 'Request body too large'}, 413)
             return
@@ -2027,6 +2346,9 @@ class KenteHandler(BaseHTTPRequestHandler):
                 return
         else:
             body = {}
+        if not isinstance(body, dict):
+            self.send_json({'error': 'JSON body must be an object'}, 400)
+            return
 
         if path == '/api/emulators/install':
             # Install missing OS-level emulator dependencies in the background.
@@ -2038,7 +2360,13 @@ class KenteHandler(BaseHTTPRequestHandler):
             # Optional: restrict install to a single system/emulator.
             system_id = (body.get('systemId') or body.get('system_id') or '').strip()
             only_keys = None
-            if system_id:
+            requested = body.get('only')
+            if requested is not None:
+                if not isinstance(requested, list) or not requested or any(key not in EMULATOR_DEPS for key in requested):
+                    self.send_json({'error': 'Unknown game engine'}, 400)
+                    return
+                only_keys = list(dict.fromkeys(requested))
+            elif system_id:
                 only_keys = [k for k, dep in EMULATOR_DEPS.items()
                              if system_id in (dep.get('systems') or [])]
                 if not only_keys:
@@ -2071,6 +2399,29 @@ class KenteHandler(BaseHTTPRequestHandler):
                             'message': 'EJS prefetch started — poll /api/ejs/prefetch/status'})
             return
 
+        elif path == '/api/bios/import':
+            sid = body.get('systemId')
+            filename = BIOS_FILES.get(sid) if isinstance(sid, str) else None
+            if not filename:
+                self.send_json({'success': False, 'error': 'Unknown BIOS system'}, 400)
+                return
+            try:
+                import base64
+                encoded = body.get('data')
+                if not isinstance(encoded, str):
+                    raise ValueError('Invalid BIOS contents')
+                data = base64.b64decode(encoded, validate=True)
+                if not data or len(data) > 6 * 1024 * 1024:
+                    raise ValueError('Invalid BIOS size')
+                BIOS_DIR.mkdir(parents=True, exist_ok=True)
+                target = BIOS_DIR / filename
+                temp = target.with_suffix(target.suffix + '.importing')
+                temp.write_bytes(data)
+                temp.replace(target)
+                self.send_json({'success': True, 'filename': filename, 'sizeBytes': len(data)})
+            except (ValueError, TypeError) as error:
+                self.send_json({'success': False, 'error': str(error)}, 400)
+
         elif path == '/api/bios/download':
             # Start the BIOS background verifier/configurer (idempotent — ignored if already running)
             if _bios_dl_state.get('running'):
@@ -2089,6 +2440,27 @@ class KenteHandler(BaseHTTPRequestHandler):
             # Write Kente UI settings to a sidecar file next to batocera.conf
             # and mirror Batocera-relevant keys to batocera.conf
             try:
+                boolean_keys = {'crtScanlines', 'vignette', 'fullScreen', 'uiSounds',
+                                'ambientHum', 'cameraVR', 'wiiPointer', 'theaterAdShield'}
+                allowed = boolean_keys | {'roomTheme', 'volume', 'theaterSandbox'}
+                if set(body) - allowed:
+                    self.send_json({'success': False, 'error': 'Unknown settings key'}, 400)
+                    return
+                if any(not isinstance(body.get(key), bool) for key in boolean_keys if key in body):
+                    self.send_json({'success': False, 'error': 'Boolean setting has invalid value'}, 400)
+                    return
+                if 'roomTheme' in body and body['roomTheme'] not in {
+                        'DEFAULT', 'NEON', 'MIDNIGHT', 'CRIMSON', 'MATRIX', 'VAPOR', 'AMBER', 'ICE', 'COPPER'}:
+                    self.send_json({'success': False, 'error': 'Invalid room theme'}, 400)
+                    return
+                if 'theaterSandbox' in body and body['theaterSandbox'] not in {'OFF', 'PERMISSIVE', 'STRICT', 'ULTRA'}:
+                    self.send_json({'success': False, 'error': 'Invalid theater sandbox mode'}, 400)
+                    return
+                if 'volume' in body and (isinstance(body['volume'], bool)
+                        or not isinstance(body['volume'], (int, float))
+                        or not 0 <= body['volume'] <= 100):
+                    self.send_json({'success': False, 'error': 'Invalid volume'}, 400)
+                    return
                 sidecar = CONF_FILE.parent / 'kente-settings.json'
                 # Atomic write: stage to .tmp then rename so a server kill
                 # mid-write never leaves a truncated kente-settings.json that
@@ -2214,6 +2586,76 @@ class KenteHandler(BaseHTTPRequestHandler):
                 self.send_json({'success': False, 'error': result}, 500)
             return
 
+        elif path == '/api/native/import':
+            if not IS_APP:
+                self.send_json({'success': False, 'error': 'Use the desktop app'}, 400)
+                return
+            try:
+                exe = import_runtime(body.get('engine'), body.get('source', ''))
+                self.send_json({'success': True, 'engine': body.get('engine')})
+            except (ValueError, TypeError, OSError) as error:
+                self.send_json({'success': False, 'error': str(error)}, 400)
+
+        elif path == '/api/native/start':
+            self.send_json(start_native_player(body))
+
+        elif path == '/api/native/control':
+            action = body.get('action')
+            session = _native_session
+            try:
+                session_id = body.get('sessionId')
+                if action == 'stop' and isinstance(session_id, str) and session_id:
+                    with _NATIVE_LOCK:
+                        _NATIVE_CANCELLED[session_id[:128]] = True
+                        while len(_NATIVE_CANCELLED) > 128:
+                            _NATIVE_CANCELLED.pop(next(iter(_NATIVE_CANCELLED)))
+                if session_id and session and session_id != session.session_id:
+                    self.send_json({'success': True})
+                    return
+                if action == 'stop':
+                    if session:
+                        session.stop()
+                    # Also stop games launched through the legacy emulator
+                    # route, which are tracked separately from NativeSession.
+                    with _PROC_LOCK:
+                        proc = active_proc
+                        if proc is not None and proc.poll() is None:
+                            if platform.system() == 'Windows':
+                                try:
+                                    subprocess.run(['taskkill', '/PID', str(proc.pid), '/T', '/F'],
+                                                   capture_output=True, timeout=8, check=False,
+                                                   creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                                except (OSError, subprocess.TimeoutExpired):
+                                    proc.kill()
+                            else:
+                                proc.terminate()
+                            try:
+                                proc.wait(timeout=3)
+                            except subprocess.TimeoutExpired:
+                                proc.kill()
+                                proc.wait(timeout=2)
+                        active_proc = None
+                elif action == 'resize' and session:
+                    session.update_rect(body.get('rect'))
+                elif action in ('menu', 'resume') and session:
+                    session.menu(action == 'menu')
+                else:
+                    self.send_json({'success': False, 'error': 'Invalid native player action'}, 400)
+                    return
+                self.send_json({'success': True})
+            except (ValueError, RuntimeError) as error:
+                self.send_json({'success': False, 'error': str(error)}, 400)
+
+        elif path == '/api/native/remote-key':
+            session = _native_session
+            try:
+                if not session or body.get('sessionId') != session.session_id:
+                    self.send_json({'success': False, 'error': 'No matching game session'}, 409); return
+                session.remote_key(body.get('key'), body.get('down'))
+                self.send_json({'success': True})
+            except (ValueError, RuntimeError) as error:
+                self.send_json({'success': False, 'error': str(error)}, 400)
+
         elif path == '/api/launch':
             sid       = body.get('systemId', '')
             rom_path  = body.get('romPath', '')
@@ -2237,11 +2679,23 @@ class KenteHandler(BaseHTTPRequestHandler):
             # Tries known emulator paths → OS file association → folder open.
             sid      = body.get('systemId', '')
             filename = body.get('filename', '')
-            if not sid or not filename:
+            if (not isinstance(sid, str) or not isinstance(filename, str)
+                    or not sid or not filename):
                 self.send_json({'success': False, 'error': 'Missing systemId or filename'}, 400)
                 return
-            folder   = SYSTEM_FOLDER.get(sid, sid)
-            rom_path = str(ROMS_DIR / folder / filename)
+            folder = SYSTEM_FOLDER.get(sid)
+            if (not folder or filename in ('.', '..')
+                    or any(char in filename for char in ('/', '\\', ':', '\x00'))):
+                self.send_json({'success': False, 'error': 'Invalid systemId or filename'}, 400)
+                return
+            rom_dir = (ROMS_DIR / folder).resolve()
+            target = (rom_dir / filename).resolve()
+            try:
+                target.relative_to(rom_dir)
+            except ValueError:
+                self.send_json({'success': False, 'error': 'ROM outside system folder'}, 403)
+                return
+            rom_path = str(target)
             ok, method, err_code, err_msg = find_and_launch_rom(sid, rom_path)
             self.send_json({'success': ok, 'method': method, 'error': err_code, 'message': err_msg})
 
@@ -2250,11 +2704,54 @@ class KenteHandler(BaseHTTPRequestHandler):
 
 # ── Entry Point ───────────────────────────────────────────────────────────────
 
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """Cap concurrent request threads; excess clients queue in the OS backlog."""
+    request_queue_size = 64
+    daemon_threads = True
+
+    def __init__(self, *args, max_workers=32, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.max_workers = max_workers
+        self._worker_slots = threading.BoundedSemaphore(max_workers)
+
+    def process_request(self, request, client_address):
+        if not self._worker_slots.acquire(blocking=False):
+            try:
+                request.sendall(b'HTTP/1.1 503 Service Unavailable\r\n'
+                                b'Connection: close\r\nContent-Length: 0\r\n\r\n')
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._worker_slots.release()
+            self.shutdown_request(request)
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._worker_slots.release()
+
+
 if __name__ == '__main__':
     print(f'[Kente Server] Starting on port {PORT}...')
+    if IS_APP and platform.system() == 'Windows':
+        try:
+            relay = start_lobby_relay()
+            print(f"[Kente Lobby] LAN relay listening on port {relay['port']}")
+        except OSError as error:
+            print(f'[Kente Lobby] Multiplayer unavailable: {error}')
     # ThreadingHTTPServer handles each request in its own thread so long-running
     # ROM-proxy streaming downloads do not block API calls (ping, settings, etc.).
-    server = ThreadingHTTPServer(('127.0.0.1', PORT), KenteHandler)
+    server = BoundedThreadingHTTPServer(('127.0.0.1', PORT), KenteHandler)
+    if hasattr(signal, 'SIGTERM'):
+        def _handle_terminate(_signum, _frame):
+            raise KeyboardInterrupt()
+        signal.signal(signal.SIGTERM, _handle_terminate)
     print(f'[Kente Server] Ready at http://localhost:{PORT}')
     if IS_BATOCERA and os.getenv('KENTE_FORCE_NATIVE'):
         print('[Kente Server] KENTE_FORCE_NATIVE=1 — running in forced native mode')
@@ -2262,3 +2759,5 @@ if __name__ == '__main__':
         server.serve_forever()
     except KeyboardInterrupt:
         print('[Kente Server] Stopped.')
+    finally:
+        server.server_close()

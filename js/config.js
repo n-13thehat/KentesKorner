@@ -5,6 +5,34 @@
    Function bodies run later (after DOMContentLoaded) and may use any file. */
 'use strict';
 
+// External provider metadata can contain media URLs. Keep these URLs out of
+// HTML/CSS sinks unless they are HTTPS or same-origin app assets.
+function safeMediaUrl(value) {
+  try {
+    const url = new URL(String(value || ''), window.location.href);
+    return url.protocol === 'https:' || url.protocol === 'http:' ? url.href : '';
+  } catch { return ''; }
+}
+
+function renderInlineStatus(target, message, { kind = 'info', className = '', retry } = {}) {
+  if (!target) return null;
+  const status = document.createElement('div');
+  status.className = ['kente-inline-status', className].filter(Boolean).join(' ');
+  status.setAttribute('role', kind === 'error' ? 'alert' : 'status');
+  status.setAttribute('aria-live', kind === 'error' ? 'assertive' : 'polite');
+  status.textContent = String(message ?? '');
+  if (typeof retry === 'function') {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'kente-status-retry';
+    button.textContent = 'RETRY';
+    button.addEventListener('click', retry, { once: true });
+    status.append(' ', button);
+  }
+  target.replaceChildren(status);
+  return status;
+}
+
 /* ── TV ZONE CONFIGURATION ──
    Positions are % of the room container.
    Adjust top/left/width/height to match your room image. */

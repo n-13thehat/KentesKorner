@@ -62,26 +62,56 @@ const BiosDB = (() => {
 
   async function get(systemId) {
     const db  = await open();
-    return new Promise(res => {
+    const stored = await new Promise(res => {
       const tx  = db.transaction(STORE, 'readonly');
       const req = tx.objectStore(STORE).get(systemId);
-      req.onsuccess = () => res(req.result?.handle || null);
+      req.onsuccess = () => res(req.result || null);
       req.onerror   = () => res(null);
     });
+    if (stored?.handle) return stored.handle;
+    if (stored?.file) return { kind: 'file', getFile: async () => stored.file };
+    if (window.electronAPI?.isElectron) {
+      try {
+        const response = await fetch(`${KENTE_SERVER_URL}/api/bios/file?systemId=${encodeURIComponent(systemId)}`);
+        if (response.ok) {
+          const file = new File([await response.blob()], response.headers.get('X-Kente-Filename') || BIOS_MAP[systemId]?.filename || 'bios.bin');
+          return { kind: 'file', getFile: async () => file };
+        }
+      } catch { /* no native BIOS yet */ }
+    }
+    return null;
   }
 
   async function set(systemId, handle, fileName) {
+    let nativeSaved = false;
     try {
+      const file = await handle.getFile();
+      if (window.electronAPI?.isElectron && KENTE_SERVER_ONLINE) {
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        let binary = '';
+        for (let offset = 0; offset < bytes.length; offset += 32768) {
+          binary += String.fromCharCode(...bytes.subarray(offset, offset + 32768));
+        }
+        const response = await fetch(`${KENTE_SERVER_URL}/api/bios/import`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ systemId, data: btoa(binary) }),
+        });
+        if (!response.ok) throw new Error('The BIOS could not be saved in Kente.');
+        nativeSaved = true;
+      }
       const db = await open();
-      return new Promise((res, rej) => {
+      return await new Promise((res, rej) => {
         const tx = db.transaction(STORE, 'readwrite');
         tx.oncomplete = res;
         tx.onerror    = () => rej(tx.error);
         tx.onabort    = () => rej(new Error('IDB transaction aborted'));
-        tx.objectStore(STORE).put({ systemId, handle, fileName, savedAt: Date.now() });
+        const persistentHandle = typeof FileSystemFileHandle !== 'undefined' && handle instanceof FileSystemFileHandle;
+        tx.objectStore(STORE).put({ systemId, handle: persistentHandle ? handle : null,
+          file: persistentHandle ? null : file, fileName, savedAt: Date.now() });
       });
     } catch (err) {
       console.warn('[BiosDB] set failed:', err.message);
+      if (!nativeSaved) throw err;
     }
   }
 
@@ -192,7 +222,7 @@ async function scanOPFSLibrary() {
         const ext = '.' + name.split('.').pop().toLowerCase();
         if (!validExts.has(ext) || !sysExts.has(ext)) continue;
         // Skip if already indexed in this session
-        const matchedGame = matchRomToGame(name, eligible);
+        const matchedGame = matchRomToGame(name, eligible)?.game;
         if (matchedGame && !ROM_STATUS[matchedGame.id]) {
           await RomDB.set(matchedGame.id, handle, name);
           ROM_STATUS[matchedGame.id] = true;
@@ -303,15 +333,17 @@ const RomSourceLedger = (() => {
 /* Resolve ranked source candidates for a (systemId, title) via the new
    /api/roms/sources endpoint. Returns [] on failure so callers can fall back
    to the legacy archive-only search path.                                  */
-async function fetchRomSources(systemId, title) {
+async function fetchRomSources(systemId, title, providers = null) {
   if (!KENTE_SERVER_ONLINE || !systemId || !title) return [];
   try {
     const params = new URLSearchParams({ systemId, title, limit: '20' });
+    if (Array.isArray(providers) && providers.length) params.set('providers', providers.join(','));
     const res = await fetch(`${KENTE_SERVER_URL}/api/roms/sources?${params}`,
                             { signal: _abortTimeout(20000) });
     if (!res.ok) return [];
     const data = await res.json();
-    const list = Array.isArray(data?.sources) ? data.sources : [];
+    const list = Array.isArray(data?.sources)
+      ? data.sources.filter(candidate => romTitleMatches(candidate.filename || '', title)) : [];
     // Blend ledger bias into the server's score so historically-reliable hosts
     // float to the top within the same /api response.
     list.forEach(c => { c._scoreBlended = (c.score || 0) + RomSourceLedger.score(c.provider); });

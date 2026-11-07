@@ -7,7 +7,8 @@ function contentSettings() {
     ? `<div id="settings-hardware-section">
          <div class="settings-group-label">HARDWARE</div>
          <div class="settings-list" id="settings-hw-list">
-           ${['BATOCERA VERSION','STORAGE FREE','STORAGE USED','CONTROLLERS','UPTIME','HOSTNAME'].map(l =>
+           ${['BATOCERA VERSION','STORAGE FREE','STORAGE USED','CONTROLLERS','UPTIME','HOSTNAME',
+              'FLASH CACHE','EMULATOR CACHE','ACTIVE REQUESTS','ACTIVE DOWNLOADS','REGISTERED PROVIDERS'].map(l =>
              `<div class="settings-item" style="cursor:default">
                <span class="settings-item-label">${l}</span>
                <span class="settings-item-value settings-hw-val" data-hw="${l.toLowerCase().replace(/ /g,'-')}">…</span>
@@ -30,15 +31,16 @@ function contentSettings() {
         <span class="settings-item-label">SIGNAL STRENGTH</span>
         <span class="settings-item-value net-status-val" id="net-status-signal">CHECKING&hellip;</span>
       </div>
-      <div class="settings-item interactive settings-item--net-action" data-net-action="refresh">
+      <div class="settings-item interactive settings-item--net-action" role="button" tabindex="0" data-net-action="refresh">
         <span class="settings-item-label">REFRESH STATUS</span>
         <span class="settings-item-value net-scan-value">&#8635; REFRESH</span>
       </div>
-      <div class="settings-item interactive settings-item--net-action" data-net-action="scan">
+      <div class="settings-item interactive settings-item--net-action" role="button" tabindex="0" data-net-action="scan">
         <span class="settings-item-label">SCAN FOR NETWORKS</span>
         <span class="settings-item-value net-scan-value">SCAN &#9654;</span>
       </div>
       <div class="settings-item interactive settings-item--net-action" data-net-action="disconnect"
+           role="button" tabindex="0"
            id="net-disconnect-row" style="display:none">
         <span class="settings-item-label">DISCONNECT</span>
         <span class="settings-item-value" style="color:var(--red)">DISCONNECT</span>
@@ -74,7 +76,8 @@ function contentSettings() {
         dataAttrs  = `data-action="${item.key}"`;
       }
 
-      return `<div class="${classes}" ${dataAttrs}>
+      const semantics = classes.includes('interactive') ? 'role="button" tabindex="0"' : '';
+      return `<div class="${classes}" ${semantics} ${dataAttrs}>
         <span class="settings-item-label">${item.label}</span>
         <span class="settings-item-value">${displayVal}</span>
       </div>`;
@@ -90,7 +93,54 @@ function contentSettings() {
 async function hydrateSettingsMenu() {
   if (!KENTE_SERVER_ONLINE) return;
   // Run hardware info + network status in parallel
-  await Promise.all([hydrateHardwareInfo(), hydrateNetworkStatus()]);
+  await Promise.all([hydrateHardwareInfo(), hydrateNetworkStatus(), hydrateDiagnostics()]);
+}
+
+async function checkForAppUpdatesFromSettings() {
+  const updater = window.electronAPI?.checkForUpdates;
+  if (!updater) { showToast('APP UPDATES ARE AVAILABLE IN THE DESKTOP APP'); return; }
+  showToast('CHECKING FOR UPDATES…');
+  try {
+    const result = await updater();
+    if (!result.success) { showToast(`UPDATE CHECK FAILED · ${result.message || 'TRY AGAIN LATER'}`); return; }
+    if (result.available) showToast(`UPDATE ${result.version} FOUND · DOWNLOADING IN BACKGROUND`);
+    else showToast(`YOU’RE UP TO DATE · VERSION ${result.version}`);
+  } catch (error) { showToast(`UPDATE CHECK FAILED · ${error.message || 'TRY AGAIN LATER'}`); }
+}
+
+function _formatBytes(bytes) {
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value < 0) return '\u2014';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let size = value, unit = 0;
+  while (size >= 1024 && unit < units.length - 1) { size /= 1024; unit++; }
+  return `${size.toFixed(unit ? 1 : 0)} ${units[unit]}`;
+}
+
+async function hydrateDiagnostics() {
+  try {
+    const res = await fetch(`${KENTE_SERVER_URL}/api/diagnostics`, { signal: _abortTimeout(8000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const d = await res.json();
+    const active = d.server?.activeRequests;
+    const max = d.server?.maxRequests;
+    const map = {
+      'flash-cache': _formatBytes(d.cache?.flash?.bytes),
+      'emulator-cache': _formatBytes((d.cache?.emulatorCores?.bytes || 0)
+        + (d.cache?.emulatorAssets?.bytes || 0)),
+      'active-requests': Number.isFinite(active) ? `${active} / ${max}` : '\u2014',
+      'active-downloads': String(d.downloads?.active ?? 0),
+      'registered-providers': `${d.providers?.rom?.length || 0} ROM · ${d.providers?.theater?.length || 0} THEATER`,
+    };
+    document.querySelectorAll('.settings-hw-val[data-hw]').forEach(el => {
+      if (Object.prototype.hasOwnProperty.call(map, el.dataset.hw)) el.textContent = map[el.dataset.hw];
+    });
+  } catch {
+    for (const key of ['flash-cache','emulator-cache','active-requests','active-downloads','registered-providers']) {
+      const el = document.querySelector(`.settings-hw-val[data-hw="${key}"]`);
+      if (el) el.textContent = '\u2014';
+    }
+  }
 }
 
 async function hydrateHardwareInfo() {

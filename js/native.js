@@ -67,6 +67,24 @@ async function refreshNativeBiosStatus() {
   } catch { /* non-critical */ }
 }
 
+// Browser cores still need HTTP access to ROMs saved by the native server.
+// File-system paths from /api/rom/exists cannot be opened by the renderer.
+async function findServerRom(game, filename = null) {
+  if (!KENTE_SERVER_ONLINE) return null;
+  try {
+    const params = new URLSearchParams({ systemId: game.systemId, title: game.title });
+    const res = await fetch(`${KENTE_SERVER_URL}/api/rom/resolve?${params}`,
+                            { signal: _abortTimeout(3000) });
+    if (!res.ok) return null;
+    const local = await res.json();
+    if (!local.found || !local.url || !local.filename) return null;
+    if (!romTitleMatches(local.filename, game.title)) return null;
+    if (filename && local.filename !== filename) return null;
+    return { url: `${KENTE_SERVER_URL}${local.url}`, filename: local.filename,
+             systemId: game.systemId, local: true };
+  } catch { return null; }
+}
+
 /* ══════════════════════════════════════════
    MOD MANAGER
    Shows available mods for a game in the
@@ -234,6 +252,7 @@ async function showModManager(game) {
    browser focus via PowerShell on exit).
 ══════════════════════════════════════════ */
 async function launchNativeApp(game) {
+  if (NativePlayer.supported() && game.nativeExe) return NativePlayer.launch(game, { exePath: game.nativeExe });
   const tv     = TV_ZONES.find(t => t.id === state.activeMenu);
   const accent = tv?.accent || 'var(--brand)';
   const overlay = document.getElementById('launch-overlay');
@@ -296,6 +315,7 @@ async function launchNativeApp(game) {
    association, or opens the containing folder.
 ══════════════════════════════════════════ */
 async function launchWithInstalledEmulator(game, dlItem) {
+  if (NativePlayer.supported()) return NativePlayer.launch(game, { filename: dlItem?.filename });
   const EMU_LABEL = {
     dreamcast:'FLYCAST', ps2:'PCSX2', gamecube:'DOLPHIN', wii:'DOLPHIN',
     wiiu:'CEMU', ps3:'RPCS3', xbox:'XEMU', xbox360:'XENIA', switch:'RYUJINX',
@@ -375,6 +395,7 @@ function _closeLaunchOverlay() {
 }
 
 async function launchNative(game, fromCloud = false, installAttempted = false, ps3SetupAttempted = false) {
+  if (NativePlayer.supported()) return NativePlayer.launch(game);
   const tv     = TV_ZONES.find(t => t.id === state.activeMenu);
   const accent = tv?.accent || 'var(--brand)';
   const overlay = document.getElementById('launch-overlay');

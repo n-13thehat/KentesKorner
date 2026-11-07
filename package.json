@@ -1,23 +1,27 @@
 {
   "name": "kentecorner",
-  "version": "2.0.0",
+  "version": "8.3.2",
   "description": "Kente's Korner — Retro Game Room",
   "main": "electron/main.js",
   "scripts": {
     "start": "electron .",
-    "build": "electron-builder --win",
+    "build": "electron-builder --win nsis",
+    "build:mac": "npm run build:server && electron-builder --mac dmg zip",
+    "prebuild": "npm run build:server && npm run build:runtimes",
     "build:server": "pyinstaller --onefile --name kente-server --distpath resources batocera/kente-server.py",
+    "build:runtimes": "python scripts/prepare-runtimes.py",
     "fetch:ejs": "python fetch-emulatorjs-pack.py",
-    "test": "node --test tests/rom_db.test.mjs tests/ejs_patches.test.mjs && python -m unittest discover tests",
-    "test:js": "node --test tests/rom_db.test.mjs tests/ejs_patches.test.mjs",
+    "check:syntax": "node scripts/check-syntax.mjs",
+    "test": "npm run test:js && npm run test:py",
+    "test:js": "node --test tests/*.test.mjs",
     "test:py": "python -m unittest discover tests"
   },
   "devDependencies": {
     "electron": "~41.1.1",
-    "electron-builder": "~26.8.1",
-    "electron-updater": "~6.8.3"
+    "electron-builder": "~26.8.1"
   },
   "dependencies": {
-    "discord-rpc": "^4.0.1"
+    "discord-rpc": "^4.0.1",
+    "electron-updater": "~6.8.3"
   }
 }

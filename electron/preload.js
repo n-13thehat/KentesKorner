@@ -14,6 +14,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
   /** True when KenteCorner is running as a packaged desktop app. */
   isElectron: true,
 
+  nativePlayerSupported: process.platform === 'win32',
+  checkForUpdates: () => ipcRenderer.invoke('kente:update:check'),
+  launchNativePlayer: (game, rect) => ipcRenderer.invoke('kente:native:launch', game, rect),
+  nativePlayerStatus: () => ipcRenderer.invoke('kente:native:status'),
+  importNativeEngine: engine => ipcRenderer.invoke('kente:native:import', engine),
+  controlNativePlayer: (action, rect, sessionId) => ipcRenderer.invoke('kente:native:control', action, rect, sessionId),
+  lobbyCaptureSources: () => ipcRenderer.invoke('kente:lobby:captureSources'),
+  lobbyRemoteKey: (key, down, sessionId) => ipcRenderer.invoke('kente:lobby:remoteKey', key, !!down, sessionId),
+
   /** Bring the KenteCorner window to the foreground. */
   focusWindow: () => ipcRenderer.send('kente:focusWindow'),
 

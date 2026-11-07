@@ -159,9 +159,29 @@ def _has_companion_bin(filename, all_names):
 
 # ── Title normalization for fuzzy matching ──────────────────────────────────
 _NORM_RE = re.compile(r'[^a-z0-9]+')
+_ROMAN_NUMBERS = {'i': '1', 'ii': '2', 'iii': '3', 'iv': '4', 'v': '5',
+                  'vi': '6', 'vii': '7', 'viii': '8', 'ix': '9', 'x': '10',
+                  'xi': '11', 'xii': '12', 'xiii': '13', 'xiv': '14', 'xv': '15'}
 
 def _norm_words(s):
-    return [w for w in _NORM_RE.sub(' ', (s or '').lower()).split() if len(w) > 2]
+    return [_ROMAN_NUMBERS.get(w, w)
+            for w in _NORM_RE.sub(' ', (s or '').lower()).split()
+            if len(w) > 2 or w.isdigit() or w in _ROMAN_NUMBERS]
+
+
+def title_matches(filename, title):
+    """Require the requested sequel number as well as a useful title match.
+
+    Ignore dump annotations so '(Disc 2)' or '[SLUS-01485]' cannot make
+    Pro Skater 4 appear to be Pro Skater 2. Arabic and Roman numerals agree.
+    """
+    clean = lambda value: re.sub(r'\([^)]*\)|\[[^]]*\]', ' ', value or '')
+    title_words = set(_norm_words(clean(title)))
+    file_words = set(_norm_words(clean(filename)))
+    numbers = {w for w in title_words if w.isdigit()}
+    if not numbers.issubset(file_words):
+        return False
+    return bool(title_words) and len(title_words & file_words) / len(title_words) >= 0.5
 
 
 def _title_overlap(filename, title):
@@ -319,7 +339,8 @@ def _archive_pick_file(files, system_id, title):
     Returns a dict mirroring the original `files[i]` plus a `hasCompanionBin`
     flag the scorer downstream uses to apply the orphan-cue penalty.
     """
-    valid = [f for f in files if _ext_match(f['name'], system_id)]
+    valid = [f for f in files if _ext_match(f['name'], system_id)
+             and title_matches(f['name'], title)]
     if not valid: return None
     all_names = [f['name'] for f in files]
     twords = set(_norm_words(title))
@@ -802,6 +823,7 @@ def fan_out_search(system_id, title, providers=None, timeout=12):
                 else:
                     print(f'[rom_providers/{name}] timed out (>{timeout}s) — partial results returned')
                     f.cancel()
+    out = [c for c in out if title_matches(c.get('filename') or '', title)]
     for c in out:
         # Stamp the system id so score_candidate() can apply per-system
         # extension-rank and container preferences without each provider

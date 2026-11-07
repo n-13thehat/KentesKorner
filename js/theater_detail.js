@@ -1,6 +1,10 @@
 /* Kente's Korner — Theater detail overlay. */
 'use strict';
 
+let _theaterDetailGeneration = 0;
+let _theaterDetailCloseTimer = null;
+let _theaterDetailReturnFocus = null;
+
 /* ── Detail overlay ──────────────────────────────────────────────────────
    `title` is an optional hint passed by the caller (e.g. from a saved
    My-List entry).  Embed providers (vidsrc / 2embed / vidsrcpm /
@@ -10,6 +14,14 @@ async function openTheaterDetail(provider, kind, slug, title) {
   if (!provider || !slug) return;
   const overlay = document.getElementById('theater-detail-overlay');
   if (!overlay) return;
+  _theaterDetailReturnFocus = document.activeElement;
+  overlay.setAttribute('role', 'dialog');
+  overlay.setAttribute('aria-modal', 'true');
+  overlay.setAttribute('aria-label', 'Theater details');
+  overlay.setAttribute('aria-hidden', 'false');
+  clearTimeout(_theaterDetailCloseTimer);
+  _theaterDetailCloseTimer = null;
+  const generation = ++_theaterDetailGeneration;
   overlay.hidden = false;
   overlay.innerHTML = `
     <button type="button" class="theater-detail-close" id="theater-detail-close">✕ CLOSE</button>
@@ -21,42 +33,89 @@ async function openTheaterDetail(provider, kind, slug, title) {
         <div class="theater-empty">LOADING DETAILS…</div>
       </div>
     </div>`;
-  requestAnimationFrame(() => overlay.classList.add('active'));
+  requestAnimationFrame(() => {
+    if (generation === _theaterDetailGeneration && !overlay.hidden) overlay.classList.add('active');
+  });
   overlay.querySelector('#theater-detail-close')
     .addEventListener('click', closeTheaterDetail);
-  overlay.addEventListener('click', e => {
-    if (e.target === overlay) closeTheaterDetail();
+  overlay.querySelector('#theater-detail-close')?.focus({ preventScroll: true });
+  renderInlineStatus(overlay.querySelector('.theater-detail-body'), 'LOADING DETAILS…', {
+    className: 'theater-empty',
   });
+  if (!overlay._theaterBackdropBound) {
+    overlay._theaterBackdropBound = true;
+    overlay.addEventListener('click', e => {
+      if (e.target === overlay) closeTheaterDetail();
+    });
+  }
   KenteAudio.click();
 
   try {
     const detailQs = { provider, kind, slug };
     if (title) detailQs.title = title;
     const d = await _theaterFetch('/api/theater/details', detailQs, 18000);
+    if (generation !== _theaterDetailGeneration || overlay.hidden) return;
     _renderTheaterDetail(provider, d);
   } catch (e) {
+    if (generation !== _theaterDetailGeneration || overlay.hidden) return;
     console.warn('[Kente/theater] details failed:', e);
     const body = overlay.querySelector('.theater-detail-body');
-    if (body) body.innerHTML = '<div class="theater-error">⚠ COULD NOT LOAD DETAILS</div>';
+    renderInlineStatus(body, 'COULD NOT LOAD DETAILS', {
+      kind: 'error', className: 'theater-error',
+      retry: () => openTheaterDetail(provider, kind, slug, title),
+    });
   }
 }
 
 function closeTheaterDetail() {
   const overlay = document.getElementById('theater-detail-overlay');
   if (!overlay) return;
+  const generation = ++_theaterDetailGeneration;
+  overlay.setAttribute('aria-hidden', 'true');
   overlay.classList.remove('active');
-  setTimeout(() => { overlay.hidden = true; overlay.innerHTML = ''; }, 280);
+  clearTimeout(_theaterDetailCloseTimer);
+  _theaterDetailCloseTimer = setTimeout(() => {
+    if (generation !== _theaterDetailGeneration) return;
+    overlay.hidden = true;
+    overlay.innerHTML = '';
+    _theaterDetailCloseTimer = null;
+    if (_theaterDetailReturnFocus?.isConnected)
+      _theaterDetailReturnFocus.focus({ preventScroll: true });
+    _theaterDetailReturnFocus = null;
+  }, 280);
   // Hand focus back to the underlying theater rows so controller nav resumes there.
   requestAnimationFrame(() => GamepadManager.resetFocus());
 }
+
+document.addEventListener('keydown', event => {
+  const overlay = document.getElementById('theater-detail-overlay');
+  if (!overlay || overlay.hidden || overlay.getAttribute('aria-hidden') === 'true') return;
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    closeTheaterDetail();
+    return;
+  }
+  if (event.key !== 'Tab') return;
+  const controls = [...overlay.querySelectorAll('button:not(:disabled), a[href], input:not(:disabled), select:not(:disabled), [tabindex]:not([tabindex="-1"])')]
+    .filter(control => control.getClientRects().length > 0);
+  if (!controls.length) return;
+  const first = controls[0], last = controls[controls.length - 1];
+  if (event.shiftKey && (document.activeElement === first || !overlay.contains(document.activeElement))) {
+    event.preventDefault(); last.focus();
+  } else if (!event.shiftKey && (document.activeElement === last || !overlay.contains(document.activeElement))) {
+    event.preventDefault(); first.focus();
+  }
+});
 
 function _renderTheaterDetail(provider, d) {
   const overlay = document.getElementById('theater-detail-overlay');
   if (!overlay || !d) return;
   const bd = overlay.querySelector('.theater-detail-backdrop');
-  if (bd && (d.backdrop || d.poster)) bd.style.backgroundImage = `url("${d.backdrop || d.poster}")`;
+  const backdropUrl = safeMediaUrl(d.backdrop || d.poster);
+  if (bd && backdropUrl) bd.style.backgroundImage = `url("${backdropUrl}")`;
   const posterEl = overlay.querySelector('.theater-detail-poster');
-  if (posterEl && d.poster) posterEl.style.backgroundImage = `url("${d.poster}")`;
+  const posterUrl = safeMediaUrl(d.poster);
+  if (posterEl && posterUrl) posterEl.style.backgroundImage = `url("${posterUrl}")`;
 
   const meta = [d.year, _fmtRuntime(d.runtime), d.quality,
                 d.rating != null ? '★ ' + d.rating : '']

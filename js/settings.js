@@ -30,14 +30,15 @@ const SETTINGS_CONFIG = [
   ]},
   { group:'SYSTEM', items:[
     { label:'Tier',             key:null,           type:'readonly', value:'LITE'             },
-    { label:'Build',            key:null,           type:'readonly', value:'01'               },
+    { label:'Build',            key:null,           type:'readonly', value:'8.3.2'             },
     { label:'Sacrifice Chamber',key:'openChamber',  type:'action',   value:'ENTER \u203A'     },
     { label:'Reset Systems',    key:'resetSystems', type:'action',   value:'FACTORY RESET'   },
     { label:'USB Boot Guide',   key:'usbGuide',     type:'action',   value:'VIEW \u203A'      },
     { label:'PS4 Console Mod',  key:'ps4Guide',     type:'action',   value:'VIEW \u203A'      },
   ]},
   { group:'ABOUT', items:[
-    { label:'Shell Version',    key:null,           type:'readonly', value:'2.0.0'            },
+    { label:'Check for Updates',key:'checkUpdates', type:'action',   value:'CHECK ↻'          },
+    { label:'App Version',      key:null,           type:'readonly', value:'8.3.2'            },
     { label:'Base OS',          key:null,           type:'readonly', value:'Alpine Linux'     },
     { label:'Library Entries',  key:null,           type:'readonly', value: () => `${(window.KenteLibrary?.games||[]).length} GAMES` },
     { label:'Discord',          key:null,           type:'readonly', value:'artkeys.json \u2192 discordAppId' },
@@ -45,6 +46,20 @@ const SETTINGS_CONFIG = [
 ];
 
 const SETTINGS_DEFAULTS = { crtScanlines:true, vignette:true, roomTheme:'DEFAULT', fullScreen:false, uiSounds:true, ambientHum:true, volume:80, cameraVR:false, wiiPointer:false, theaterSandbox:'OFF', theaterAdShield:true };
+function normalizeSettings(raw) {
+  const value = { ...SETTINGS_DEFAULTS };
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return value;
+  const boolKeys = ['crtScanlines', 'vignette', 'fullScreen', 'uiSounds', 'ambientHum',
+    'cameraVR', 'wiiPointer', 'theaterAdShield'];
+  for (const key of boolKeys) if (typeof raw[key] === 'boolean') value[key] = raw[key];
+  const themes = ['DEFAULT', 'NEON', 'MIDNIGHT', 'CRIMSON', 'MATRIX', 'VAPOR', 'AMBER', 'ICE', 'COPPER'];
+  const sandboxModes = ['OFF', 'PERMISSIVE', 'STRICT', 'ULTRA'];
+  if (themes.includes(raw.roomTheme)) value.roomTheme = raw.roomTheme;
+  if (sandboxModes.includes(raw.theaterSandbox)) value.theaterSandbox = raw.theaterSandbox;
+  if (typeof raw.volume === 'number' && Number.isFinite(raw.volume))
+    value.volume = Math.max(0, Math.min(100, raw.volume));
+  return value;
+}
 let appSettings = (() => {
   try {
     const raw = JSON.parse(localStorage.getItem('kente_settings')||'{}');
@@ -53,7 +68,7 @@ let appSettings = (() => {
       raw.theaterSandbox = raw.strictSandbox ? 'STRICT' : 'OFF';
       delete raw.strictSandbox;
     }
-    return {...SETTINGS_DEFAULTS, ...raw};
+    return normalizeSettings(raw);
   } catch { return {...SETTINGS_DEFAULTS}; }
 })();
 

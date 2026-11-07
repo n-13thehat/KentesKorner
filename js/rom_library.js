@@ -17,7 +17,10 @@ async function initRomLibrary() {
   if (KENTE_SERVER_ONLINE) return; // native: server owns the filesystem
 
   // 1 — Scan user-set manual library if permission is already granted
-  const entry = await LibraryDB.getRoot();
+  const entry = await LibraryDB.getRoot().catch(e => {
+    console.warn('[initRomLibrary] Could not read saved library:', e);
+    return null;
+  });
   if (entry?.handle) {
     try {
       const perm = await entry.handle.queryPermission({ mode: 'read' });
@@ -46,7 +49,14 @@ async function silentScanLibrary(dirHandle, announce = false) {
 
   const allFiles = [];
   // Precompute a Set of all valid ROM extensions once, outside the walk loop
-  const validExtSet = new Set(Object.values(ROM_EXT).flat());
+  const gamesByExtension = new Map();
+  for (const game of lib.games) {
+    for (const ext of ROM_EXT[game.systemId] || []) {
+      if (!gamesByExtension.has(ext)) gamesByExtension.set(ext, []);
+      gamesByExtension.get(ext).push(game);
+    }
+  }
+  const validExtSet = new Set(gamesByExtension.keys());
   async function walk(dir, depth = 0) {
     if (depth > 4) {
       console.warn('[Kente] silentScanLibrary: max nesting depth reached — some subdirectories were skipped');
@@ -69,7 +79,7 @@ async function silentScanLibrary(dirHandle, announce = false) {
 
   let matched = 0;
   for (const f of allFiles) {
-    const eligible = lib.games.filter(g => (ROM_EXT[g.systemId] || []).includes(f.ext));
+    const eligible = gamesByExtension.get(f.ext) || [];
     const result   = matchRomToGame(f.name, eligible);
     if (result) {
       await RomDB.set(result.game.id, f.handle, f.name);
@@ -97,11 +107,15 @@ function refreshGameCardDots() {
    and immediately scans it. Called from Sources and rom-options UI. */
 async function setRomLibraryRoot() {
   if (!('showDirectoryPicker' in window)) {
-    showToast('⚠ DIRECTORY PICKER REQUIRES CHROME OR EDGE');
+    showToast('⚠ THIS BROWSER DOES NOT SUPPORT FOLDER ACCESS — OPEN IN CHROME OR EDGE');
     return;
   }
   try {
-    const dirHandle = await window.showDirectoryPicker({ mode: 'read' });
+    const dirHandle = await window.showDirectoryPicker({
+      mode: 'read',
+      id: 'kente-rom-library',
+      startIn: 'documents',
+    });
     await LibraryDB.setRoot(dirHandle);
     KenteAudio.powerUp();
     await silentScanLibrary(dirHandle, true);
