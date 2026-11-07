@@ -4,7 +4,8 @@ A retro game room with a searchable game catalog, collections, controller naviga
 browser emulators, in-app native emulator launching, downloads, Flash games, and a video theater.
 It runs in a browser, the Electron desktop app, or a Batocera kiosk.
 
-Desktop builds target Windows x64 and macOS (Apple Silicon and Intel). The
+Desktop builds target Windows x64 and Intel macOS (Apple Silicon Macs can run
+the Intel app through Rosetta). The
 Windows installer includes the Windows native emulator path. The macOS build
 supports the web player and browser based emulators; native desktop emulator
 launching and PS2 room hosting remain Windows-only. The macOS DMG is currently
@@ -16,7 +17,7 @@ To package on the matching operating system, install Node.js 24, Python 3.12,
 and PyInstaller, then run `npm ci`. On Windows run `npm run build -- --publish
 never`. On macOS run `npm run build:mac -- --publish never`; this produces a DMG
 and ZIP under `dist/`. Push a tag matching the app version (for example
-`v8.3.2`) to build Windows and Intel/Apple Silicon Mac installers and publish a
+`v8.3.2`) to build Windows and Intel Mac installers and publish a
 GitHub Release. Windows packaged apps can check and download that release from
 Settings; a source commit without a new version tag does not publish an
 installable app update.

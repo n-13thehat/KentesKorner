@@ -15,8 +15,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-14
-            arch: arm64
           - runner: macos-15-intel
             arch: x64
     runs-on: ${{ matrix.runner }}
@@ -40,7 +38,7 @@ jobs:
         run: python -m pip install pyinstaller
       - name: Prepare optional Windows-only resource folders
         run: mkdir -p resources/emulators resources/runtime-dlls cache/ejs-stable cache/ejs-cores
-      - run: npm ci
+      - run: npm install
       - name: Build macOS installer
         run: npm run build:mac -- --${{ matrix.arch }} --publish never
       - name: Give this architecture a distinct artifact name
@@ -62,6 +60,8 @@ jobs:
       version: ${{ steps.version.outputs.value }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          lfs: true
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -94,7 +94,7 @@ jobs:
             Copy-Item -Path "$offlinePack/*" -Destination 'cache/ejs-stable' -Recurse -Force
           }
       - name: Build Windows installer and updater metadata
-        run: npm ci; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; npm run build -- --publish never
+        run: npm install; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; npm run build -- --publish never
         shell: pwsh
       - uses: actions/upload-artifact@v4
         with:
@@ -122,7 +122,7 @@ jobs:
           files: release-assets/*
           overwrite_files: true
           body: |
-            Kente's Korner ${{ needs.windows.outputs.version }} for Windows x64 and macOS Intel/Apple Silicon.
+            Kente's Korner ${{ needs.windows.outputs.version }} for Windows x64 and Intel macOS. The Mac app runs on Apple Silicon through Rosetta.
 
             Windows builds support native emulator launching and in-app updates. macOS builds support browser emulation; native emulator hosting is Windows-only. macOS installers are unsigned and require Gatekeeper approval.
           draft: false
