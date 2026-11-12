@@ -13,7 +13,7 @@ if (!arch) throw new Error(`Unsupported PCEE2 Mac architecture: ${process.arch}`
 const destination = path.join(root, 'resources', 'emulators', 'pcee2');
 const temporary = await mkdtemp(path.join(os.tmpdir(), 'kente-pcee2-'));
 
-function run(command, args, cwd = root, env = process.env, capture = true) {
+function run(command, args, cwd = root, env = process.env, capture = true, preserveLeadingWhitespace = false) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { cwd, env, stdio: capture ? ['ignore', 'pipe', 'pipe'] : 'inherit' });
     let stdout = '', stderr = '';
@@ -22,7 +22,7 @@ function run(command, args, cwd = root, env = process.env, capture = true) {
       child.stderr.on('data', chunk => { stderr += chunk; });
     }
     child.on('error', reject);
-    child.on('close', code => code === 0 ? resolve(stdout.trim())
+    child.on('close', code => code === 0 ? resolve(preserveLeadingWhitespace ? stdout.trimEnd() : stdout.trim())
       : reject(new Error(`${command} exited ${code}: ${stderr.trim()}`)));
   });
 }
@@ -43,10 +43,16 @@ try {
   const revision = await run('git', ['rev-parse', 'HEAD'], source);
   if (revision.toLowerCase() !== expectedRevision.toLowerCase())
     throw new Error(`PCEE2 checkout mismatch: expected ${expectedRevision}, found ${revision}.`);
-  const submoduleRevisions = await run('git', ['submodule', 'status', '--recursive'], source);
-  if (!submoduleRevisions.trim() || submoduleRevisions.split(/\r?\n/)
+  // `run()` trims command output. Preserve the leading status character here:
+  // Git uses a leading space for a matching submodule, and `trim()` would
+  // remove it from the first line and falsely reject every valid checkout.
+  const submoduleStatus = await run('git', ['submodule', 'status', '--recursive'], source,
+    process.env, true, true);
+  const submoduleRevisions = submoduleStatus.trimEnd();
+  const submoduleLines = submoduleRevisions.split(/\r?\n/);
+  if (!submoduleRevisions.trim() || submoduleLines
     .some(line => !/^ [a-f\d]{40,64} /i.test(line)))
-    throw new Error('The PCEE2 source checkout has missing or mismatched submodules.');
+    throw new Error(`The PCEE2 source checkout has missing or mismatched submodules:\n${submoduleStatus}`);
   const dependencyVersions = await readFile(path.join(source, 'pcee2-libretro', 'scripts', 'deps.versions'), 'utf8');
   const moltenVkVersion = dependencyVersions.match(/^MOLTENVK=(v[\w.-]+)$/m)?.[1];
   if (!moltenVkVersion) throw new Error('The checked-out PCEE2 source does not pin its MoltenVK release.');
