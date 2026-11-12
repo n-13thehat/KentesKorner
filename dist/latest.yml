@@ -1,8 +1,8 @@
-version: 8.3.2
+version: 9.1.9
 files:
-  - url: kentecorner-setup-8.3.2.exe
-    sha512: 9WMOr7zcuARfzUnpWY+vd3QhjsiWmXsQ3yt5XXWm4XgTOEVH0PpPouvh3zQXa3KPo1u8QcWN9W5p3L8eVmSIyA==
-    size: 339516250
-path: kentecorner-setup-8.3.2.exe
-sha512: 9WMOr7zcuARfzUnpWY+vd3QhjsiWmXsQ3yt5XXWm4XgTOEVH0PpPouvh3zQXa3KPo1u8QcWN9W5p3L8eVmSIyA==
-releaseDate: '2026-11-07T20:54:57.664Z'
+  - url: kentecorner-setup-9.1.9.exe
+    sha512: vztI5yHMksiZTsIoGlcxK1rzcMI5/N1UrkF+G3J6xs0tsiujkm0ie0kg/vOoP/ZDJMIVIp97DHxW2LNTc6rwPw==
+    size: 343964818
+path: kentecorner-setup-9.1.9.exe
+sha512: vztI5yHMksiZTsIoGlcxK1rzcMI5/N1UrkF+G3J6xs0tsiujkm0ie0kg/vOoP/ZDJMIVIp97DHxW2LNTc6rwPw==
+releaseDate: '2026-11-12T19:42:51.390Z'

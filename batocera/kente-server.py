@@ -4,9 +4,9 @@ Kente's Korner — Native API Server
 Serves the web shell and bridges to Batocera's emulation stack.
 stdlib only — no pip required.
 """
-__version__ = '8.3.2'
+__version__ = '9.1.9'
 
-import hashlib, json, os, platform, re, shutil, signal, subprocess, sys, tempfile, threading, time, zipfile
+import hashlib, io, json, os, platform, re, shutil, signal, subprocess, sys, tempfile, threading, time, zipfile
 import urllib.request, urllib.parse, urllib.error
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -37,6 +37,7 @@ except Exception as _roms_err:
 
 from kente_config import (
     ARCHIVE_PACKS, BASE, BIOS_DIR, BIOS_FILES, COMMUNITY_CORES, CONF_FILE,
+    _FLYCAST_CORE_METADATA,
     EJS_CDN_BASE, EJS_CORES_DIR, EJS_SEED_DIR, EJS_STABLE_DIR,
     FLASH_CACHE_DIR, IS_APP, IS_BATOCERA, MAX_ROM_DL_SECS,
     MAX_ROM_FILE_BYTES, MIME, NATIVE_EMU_LIN, NATIVE_EMU_WIN, PORT,
@@ -844,7 +845,9 @@ def _extract_rom_container(system_id: str, rom_file: Path) -> Path:
     else:
         # Per-system preference table: extensions ranked best-first.
         _PREFS = {
-            'ps2':       ('.chd', '.iso', '.cue', '.bin'),
+            # PCEE2 accepts these PS2 disc image formats. Keep archive
+            # selection aligned with the Mac in-process core and ROM_EXT.
+            'ps2':       ('.m3u', '.chd', '.iso', '.cso', '.zso', '.gz', '.mdf', '.nrg', '.cue', '.bin', '.elf', '.irx', '.gs', '.acgame'),
             'ps1':       ('.chd', '.pbp', '.cue', '.bin', '.iso'),
             'psx':       ('.chd', '.pbp', '.cue', '.bin', '.iso'),
             'psp':       ('.chd', '.cso', '.iso', '.pbp'),
@@ -1364,20 +1367,36 @@ class KenteHandler(BaseHTTPRequestHandler):
         if fname and fname in COMMUNITY_CORES:
             cached = EJS_CORES_DIR / fname
             if not cached.exists():
-                dl_url = COMMUNITY_CORES[fname]
+                seed = EJS_SEED_DIR.parent / 'ejs-cores' / fname
                 try:
-                    print(f'[ejs-core] Downloading {fname} from GitHub…')
                     EJS_CORES_DIR.mkdir(parents=True, exist_ok=True)
-                    req = urllib.request.Request(
-                        dl_url, headers={'User-Agent': 'KenteKorner/1.0'})
-                    with _safe_urlopen(req, timeout=120) as resp:
-                        data = resp.read()
-                    tmp = cached.with_suffix('.tmp')
-                    tmp.write_bytes(data)
-                    tmp.rename(cached)
-                    print(f'[ejs-core] Cached {fname} ({len(data)//1024} KB)')
+                    if seed.is_file():
+                        shutil.copyfile(seed, cached)
+                        print(f'[ejs-core] Installed bundled {fname}')
+                    else:
+                        core_assets = COMMUNITY_CORES[fname]
+                        print(f'[ejs-core] Downloading pinned assets for {fname}…')
+                        asset_bytes = {}
+                        for asset_name, (dl_url, expected_hash) in core_assets.items():
+                            req = urllib.request.Request(
+                                dl_url, headers={'User-Agent': 'KenteKorner/1.0'})
+                            with _safe_urlopen(req, timeout=120) as resp:
+                                payload = resp.read()
+                            if hashlib.sha256(payload).hexdigest() != expected_hash:
+                                raise ValueError(f'{asset_name} checksum mismatch')
+                            asset_bytes[asset_name] = payload
+                        data_buffer = io.BytesIO()
+                        with zipfile.ZipFile(data_buffer, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as bundle:
+                            for asset_name, payload in asset_bytes.items():
+                                bundle.writestr(asset_name, payload)
+                            bundle.writestr('core.json', json.dumps(_FLYCAST_CORE_METADATA, separators=(',', ':')))
+                        data = data_buffer.getvalue()
+                        tmp = cached.with_suffix('.tmp')
+                        tmp.write_bytes(data)
+                        tmp.replace(cached)
+                        print(f'[ejs-core] Cached {fname} ({len(data)//1024} KB)')
                 except Exception as e:
-                    print(f'[ejs-core] Download failed: {e}')
+                    print(f'[ejs-core] Core setup failed: {e}')
                     self.send_response(502); self.end_headers(); return
             self._send_file(cached, 'application/octet-stream')
             return
@@ -1602,6 +1621,8 @@ class KenteHandler(BaseHTTPRequestHandler):
                 'platform': platform.system(),
                 'batocera': IS_BATOCERA,   # true only on real Batocera/Linux
                 'electron': IS_APP,        # true when running inside Electron desktop app
+                'romProvidersAvailable': roms is not None,
+                'romProviderCount': len(roms.PROVIDERS) if roms is not None else 0,
             })
         elif path == '/api/local-library':
             # Returns installed emulators + local ROMs so the Kente's Repo panel
@@ -2002,9 +2023,26 @@ class KenteHandler(BaseHTTPRequestHandler):
         elif path == '/api/rom/resolve':
             sid = qs.get('systemId', [''])[0]
             title = qs.get('title', [''])[0]
+            filename = qs.get('filename', [''])[0]
             if sid not in SYSTEM_FOLDER or not title:
                 self.send_json({'error': 'Invalid systemId or title'}, 400); return
-            found = find_rom(sid, title)
+            found = None
+            if filename and Path(filename).name == filename and filename not in ('.', '..') \
+                    and not any(c in filename for c in ('/', '\\', ':', '\x00')):
+                # A completed Download Center item should reopen the exact ROM
+                # it saved, even when another region/revision also matches the
+                # same catalog title. Search both supported library layouts.
+                for folder in dict.fromkeys((SYSTEM_FOLDER[sid], sid)):
+                    candidate = (ROMS_DIR / folder / filename).resolve()
+                    try:
+                        candidate.relative_to((ROMS_DIR / folder).resolve())
+                    except ValueError:
+                        continue
+                    if candidate.is_file() and candidate.stat().st_size > 64:
+                        found = str(candidate)
+                        break
+            if not found:
+                found = find_rom(sid, title)
             if not found:
                 self.send_json({'found': False}); return
             target = Path(found)
@@ -2348,6 +2386,41 @@ class KenteHandler(BaseHTTPRequestHandler):
             body = {}
         if not isinstance(body, dict):
             self.send_json({'error': 'JSON body must be an object'}, 400)
+            return
+
+        if path == '/api/rom/prepare':
+            sid = body.get('systemId')
+            filename = body.get('filename')
+            folder = SYSTEM_FOLDER.get(sid) if isinstance(sid, str) else None
+            if (not folder or not isinstance(filename, str) or not filename
+                    or filename in ('.', '..')
+                    or any(char in filename for char in ('/', '\\', ':', '\x00'))):
+                self.send_json({'success': False, 'error': 'Invalid systemId or filename'}, 400)
+                return
+            rom = None
+            for candidate_folder in dict.fromkeys((folder, sid)):
+                base = (ROMS_DIR / candidate_folder).resolve()
+                candidate = (base / filename).resolve()
+                try:
+                    candidate.relative_to(base)
+                except ValueError:
+                    continue
+                if candidate.is_file() and candidate.stat().st_size > 64:
+                    rom = candidate
+                    break
+            if rom is None:
+                self.send_json({'success': False, 'error': 'ROM_NOT_FOUND'}, 404)
+                return
+            try:
+                if rom.suffix.lower() in ('.zip', '.7z', '.rar'):
+                    rom = _extract_rom_container(sid, rom)
+                if not rom.is_file() or rom.stat().st_size <= 64:
+                    raise RuntimeError('The prepared game image is missing or empty')
+                self.send_json({'success': True, 'path': str(rom), 'filename': rom.name,
+                                'sizeBytes': rom.stat().st_size})
+            except Exception as error:
+                self.send_json({'success': False, 'error': 'ROM_PREPARE_FAILED',
+                                'message': str(error)[:500]}, 422)
             return
 
         if path == '/api/emulators/install':

@@ -17,7 +17,10 @@ jobs:
         include:
           - runner: macos-15-intel
             arch: x64
+          - runner: macos-15
+            arch: arm64
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
     outputs:
       version: ${{ steps.version.outputs.value }}
     steps:
@@ -36,11 +39,25 @@ jobs:
           python-version: "3.12"
       - name: Install packaging tools
         run: python -m pip install pyinstaller
+      - name: Install native build tools
+        run: brew install cmake ninja nasm
+      - name: Cache PCEE2 build dependencies
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/kente-pcee2-dependencies
+          key: kente-pcee2-${{ matrix.arch }}-${{ hashFiles('scripts/pcee2-mac-revision.txt', 'scripts/fetch-mac-pcee2.mjs') }}
       - name: Prepare optional Windows-only resource folders
         run: mkdir -p resources/emulators resources/runtime-dlls cache/ejs-stable cache/ejs-cores
       - run: npm install
+      - name: Check application syntax
+        run: npm run check:syntax
       - name: Build macOS installer
         run: npm run build:mac -- --${{ matrix.arch }} --publish never
+        env:
+          KENTE_PCEE2_DEPS_DIR: ${{ runner.temp }}/kente-pcee2-dependencies/${{ matrix.arch }}/prefix
+          KENTE_PCEE2_DEPS_WORKDIR: ${{ runner.temp }}/kente-pcee2-dependencies/${{ matrix.arch }}/work
+      - name: Verify packaged native player components
+        run: node scripts/verify-mac-native-package.mjs ${{ matrix.arch }}
       - name: Give this architecture a distinct artifact name
         run: |
           mv dist/kentecorner-setup-${{ steps.version.outputs.value }}.dmg dist/kentecorner-setup-${{ steps.version.outputs.value }}-${{ matrix.arch }}.dmg
@@ -122,8 +139,8 @@ jobs:
           files: release-assets/*
           overwrite_files: true
           body: |
-            Kente's Korner ${{ needs.windows.outputs.version }} for Windows x64 and Intel macOS. The Mac app runs on Apple Silicon through Rosetta.
+            Kente's Korner ${{ needs.windows.outputs.version }} for Windows x64, Intel macOS, and Apple Silicon macOS.
 
-            Windows builds support native emulator launching and in-app updates. macOS builds support browser emulation; native emulator hosting is Windows-only. macOS installers are unsigned and require Gatekeeper approval.
+            Windows builds support native emulator launching and in-app updates. macOS builds include an experimental in-app PS2 core requiring a user-provided BIOS; other native-only Mac systems remain unavailable. Batocera/Linux builds use their native emulator stack. macOS installers are unsigned and require Gatekeeper approval.
           draft: false
           prerelease: false

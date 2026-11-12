@@ -302,6 +302,16 @@ document.addEventListener('click', e => {
     hideIngameMenu();
     return;
   }
+  if (e.target.closest('#igm-disc-prev')) {
+    KenteAudio.click();
+    NativePlayer.changeDisc(-1);
+    return;
+  }
+  if (e.target.closest('#igm-disc-next')) {
+    KenteAudio.click();
+    NativePlayer.changeDisc(1);
+    return;
+  }
   if (e.target.closest('#igm-close')) {
     KenteAudio.click();
     closeGame();

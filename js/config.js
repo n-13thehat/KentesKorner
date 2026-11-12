@@ -164,7 +164,9 @@ const ROM_EXT = {
   nds:        ['.nds','.zip'],
   dreamcast:  ['.cdi','.gdi','.iso','.zip','.rar','.7z'],
   psp:        ['.iso','.cso','.pbp','.zip','.rar'],
-  ps2:        ['.iso','.bin','.zip','.rar','.7z'],
+  // Keep native Mac PCEE2's supported disc formats discoverable in the
+  // library as well as directly launchable from Download Center.
+  ps2:        ['.m3u','.chd','.iso','.cso','.zso','.gz','.mdf','.nrg','.cue','.bin','.elf','.irx','.gs','.acgame','.zip','.rar','.7z'],
   gamecube:   ['.iso','.gcm','.rvz','.zip','.rar','.7z'],
   wii:        ['.iso','.wbfs','.rvz','.zip','.rar','.7z'],
   xbox:       ['.iso','.xiso','.zip','.rar','.7z'],
@@ -183,7 +185,7 @@ const ROM_EXT = {
 // over orphan .cue files on disc systems.  Keep in sync with rom_providers.py.
 const EXT_RANK_BY_SYS = {
   ps1:        ['.chd','.pbp','.zip','.7z','.rar','.iso','.cue','.bin','.img'],
-  ps2:        ['.chd','.zip','.7z','.iso','.cue','.bin'],
+  ps2:        ['.m3u','.chd','.zip','.7z','.iso','.cso','.zso','.gz','.mdf','.nrg','.cue','.bin','.elf','.irx','.gs','.acgame'],
   psp:        ['.chd','.cso','.zip','.7z','.iso','.pbp'],
   saturn:     ['.chd','.zip','.7z','.iso','.cue','.bin'],
   segacd:     ['.chd','.zip','.7z','.iso','.cue','.bin'],

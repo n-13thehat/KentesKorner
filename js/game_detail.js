@@ -116,7 +116,7 @@ function openGameDetail(gameId) {
 
   // ROM status for the detail panel
   const isFlashGdp  = g.systemId === 'flash';
-  const romFound    = isFlashGdp || KENTE_SERVER_ONLINE || !!ROM_STATUS[g.id];
+  const romFound    = isFlashGdp || !!ROM_STATUS[g.id];
   const romStatus   = isFlashGdp ? 'STREAMING (FLASH)' : (romFound ? 'ROM IN LIBRARY' : 'NOT IN LIBRARY');
   const romColor    = (isFlashGdp || romFound) ? 'var(--green)' : 'var(--text-dim)';
 
@@ -304,11 +304,11 @@ async function launchGame(g) {
   // On real Batocera (serverIsBatocera=true): ALL systems use the native emulator
   // launcher for best performance and compatibility — Batocera manages everything.
   //
-  // On a dev machine (serverIsBatocera=false): CORE_MAP systems use EmulatorJS so
-  // the developer can test them without real hardware. For native-only systems
-  // (PS2, GameCube, etc.) with no CDN core — Dreamcast now plays via flycast-wasm:
-  //   • Server reachable  → search Archive.org and download the ROM locally
-  //   • Server offline    → show "NATIVE MODE REQUIRED" dead-end screen
+  // On a desktop dev machine (serverIsBatocera=false): CORE_MAP systems use
+  // EmulatorJS; native-only systems use the desktop native host when available
+  // (experimental PS2 in-app support on Mac). With the server reachable, games
+  // can be downloaded locally. Without a compatible host, show the native-mode
+  // guidance screen.
   if (serverIsBatocera) { launchNative(g); return; }
 
   // Not on real Batocera — systems with no WebAssembly core cannot run in browser
@@ -318,7 +318,7 @@ async function launchGame(g) {
     const dlItem = DownloadManager.getAll().find(i => i.game?.id === g.id && i.status === 'complete');
     if (dlItem) { launchFromDownloadCenter(dlItem.id); return; }
 
-    if (KENTE_SERVER_ONLINE) {
+    if (KENTE_SERVER_ONLINE && (serverIsBatocera || NativePlayer.supported(g.systemId))) {
       // Server is reachable on this (non-Batocera) machine.
       // launchNative() → /api/launch → find_rom() checks the local roms/ folder
       // first and opens with the installed emulator (Dolphin, PCSX2, etc.).

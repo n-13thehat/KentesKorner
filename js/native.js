@@ -38,7 +38,7 @@ async function detectKenteServer(retry = true) {
       serverIsBatocera    = !!data.batocera;         // true only on real Batocera
       serverIsElectron    = !!data.electron;         // true inside packaged Electron app
       KENTE_SERVER_ONLINE = true;
-      console.log(`[Kente] Server online — platform: ${serverPlatform} · batocera: ${serverIsBatocera} · electron: ${serverIsElectron}`);
+      console.log(`[Kente] Server online — platform: ${serverPlatform} · batocera: ${serverIsBatocera} · electron: ${serverIsElectron} · ROM providers: ${data.romProvidersAvailable ? data.romProviderCount : 'unavailable'}`);
       _updateServerDot();
       refreshNativeBiosStatus();
     }
@@ -73,6 +73,7 @@ async function findServerRom(game, filename = null) {
   if (!KENTE_SERVER_ONLINE) return null;
   try {
     const params = new URLSearchParams({ systemId: game.systemId, title: game.title });
+    if (filename) params.set('filename', filename);
     const res = await fetch(`${KENTE_SERVER_URL}/api/rom/resolve?${params}`,
                             { signal: _abortTimeout(3000) });
     if (!res.ok) return null;
@@ -252,7 +253,7 @@ async function showModManager(game) {
    browser focus via PowerShell on exit).
 ══════════════════════════════════════════ */
 async function launchNativeApp(game) {
-  if (NativePlayer.supported() && game.nativeExe) return NativePlayer.launch(game, { exePath: game.nativeExe });
+  if (NativePlayer.supported(game.systemId) && game.nativeExe) return NativePlayer.launch(game, { exePath: game.nativeExe });
   const tv     = TV_ZONES.find(t => t.id === state.activeMenu);
   const accent = tv?.accent || 'var(--brand)';
   const overlay = document.getElementById('launch-overlay');
@@ -315,7 +316,7 @@ async function launchNativeApp(game) {
    association, or opens the containing folder.
 ══════════════════════════════════════════ */
 async function launchWithInstalledEmulator(game, dlItem) {
-  if (NativePlayer.supported()) return NativePlayer.launch(game, { filename: dlItem?.filename });
+  if (NativePlayer.supported(game.systemId)) return NativePlayer.launch(game, { filename: dlItem?.filename });
   const EMU_LABEL = {
     dreamcast:'FLYCAST', ps2:'PCSX2', gamecube:'DOLPHIN', wii:'DOLPHIN',
     wiiu:'CEMU', ps3:'RPCS3', xbox:'XEMU', xbox360:'XENIA', switch:'RYUJINX',
@@ -394,8 +395,8 @@ function _closeLaunchOverlay() {
   if (overlay) overlay.classList.remove('active');
 }
 
-async function launchNative(game, fromCloud = false, installAttempted = false, ps3SetupAttempted = false) {
-  if (NativePlayer.supported()) return NativePlayer.launch(game);
+async function launchNative(game, fromCloud = false, installAttempted = false, ps3SetupAttempted = false, nativeOptions = {}) {
+  if (NativePlayer.supported(game.systemId)) return NativePlayer.launch(game, nativeOptions);
   const tv     = TV_ZONES.find(t => t.id === state.activeMenu);
   const accent = tv?.accent || 'var(--brand)';
   const overlay = document.getElementById('launch-overlay');

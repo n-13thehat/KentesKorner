@@ -10,11 +10,22 @@
  *  5. Kill the server process on quit — no orphan processes left behind
  */
 
-const { app, BrowserWindow, ipcMain, shell, dialog, desktopCapturer } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, desktopCapturer } = require('electron');
 const { spawn, execFileSync } = require('child_process');
+const { randomUUID } = require('crypto');
 const path  = require('path');
 const fs    = require('fs');
 const http  = require('http');
+
+let macPlayerSurface = null;
+let macLibretroHost = null;
+let macLaunchGeneration = 0;
+if (process.platform === 'darwin') {
+  try { macPlayerSurface = require('./native/mac-player.node'); }
+  catch (error) { console.error('[kente] Mac native player surface unavailable:', error.message); }
+  try { macLibretroHost = require('./native/mac-libretro.node'); }
+  catch (error) { console.error('[kente] Mac libretro host unavailable:', error.message); }
+}
 
 // Prefer the discrete GPU on hybrid-graphics Windows laptops for the shell
 // and EmulatorJS WebGL renderer.
@@ -25,7 +36,7 @@ const SERVER_TIMEOUT = 30_000;   // ms to wait for server to boot
 
 let mainWindow    = null;
 let serverProcess = null;
-let _theaterActive = false;   // set via IPC; gates the window-open + will-navigate handlers
+let _theaterActive = false;   // legacy renderer state; navigation policy applies unconditionally
 
 // ── Discord Rich Presence ─────────────────────────────────────────────────────
 // Requires artkeys.json  →  { "discordAppId": "YOUR_APPLICATION_ID" }
@@ -234,35 +245,35 @@ function createWindow() {
     mainWindow.webContents.send('kente:window:fullScreenChanged', false);
   });
 
-  // Open external links in the default browser, not in Electron — but
-  // suppress them while the Theater is active. Ad scripts inside embed
-  // iframes call window.open(adUrl), which Electron turns into
-  // shell.openExternal and pops the user's default browser. The renderer
-  // sets _theaterActive via IPC whenever the theater overlay is showing.
+  // Keep Kente standalone: deny popups instead of opening a system browser.
+  // Allow only the local Kente server as a top-level navigation target.
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (_theaterActive) return { action: 'deny' };
-    // Strict protocol check — startsWith('http') alone would also match
-    // weird custom schemes like httpfoo:// that a malicious embed could
-    // craft to bounce through the OS handler.
-    if (url.startsWith('http://') || url.startsWith('https://')) {
-      shell.openExternal(url);
-    }
     return { action: 'deny' };
   });
 
-  // Block ad-driven top-frame redirects while the Theater is active. An
-  // iframe ad doing `top.location = adUrl` would otherwise navigate the
-  // whole app away from the loaded http://localhost server URL.
-  mainWindow.webContents.on('will-navigate', (event, url) => {
+  const isKenteLocalUrl = url => {
     try {
       const u = new URL(url);
-      if ((u.hostname === 'localhost' || u.hostname === '127.0.0.1')
-          && Number(u.port || 80) === SERVER_PORT && u.protocol === 'http:') return;
+      return (u.hostname === 'localhost' || u.hostname === '127.0.0.1')
+        && Number(u.port || 80) === SERVER_PORT && u.protocol === 'http:';
     } catch {}
-    event.preventDefault();
+    return false;
+  };
+  const blockExternalTopLevelNavigation = (event, url) => {
+    if (!isKenteLocalUrl(url)) event.preventDefault();
+  };
+  mainWindow.webContents.on('will-navigate', blockExternalTopLevelNavigation);
+  mainWindow.webContents.on('will-redirect', (event, url, _isInPlace, isMainFrame) => {
+    // Remote game content may redirect inside its embedded frame, but it
+    // cannot replace Kente's local app page.
+    if (isMainFrame) blockExternalTopLevelNavigation(event, url);
   });
 
   mainWindow.on('closed', () => { mainWindow = null; });
+  mainWindow.on('close', () => {
+    if (process.platform !== 'darwin') return;
+    stopMacPlayerAndDetach();
+  });
 }
 
 // ── IPC handlers ─────────────────────────────────────────────────────────────
@@ -296,6 +307,222 @@ function isPlayerSender(event) {
       && Number(url.port || 80) === SERVER_PORT;
   } catch { return false; }
 }
+
+function macPcee2ResourcePath(...parts) {
+  const base = app.isPackaged
+    ? path.join(process.resourcesPath, 'emulators', 'pcee2')
+    : path.join(__dirname, '..', 'resources', 'emulators', 'pcee2');
+  return path.join(base, ...parts);
+}
+
+function macPcee2Revision() {
+  try {
+    const revision = fs.readFileSync(macPcee2ResourcePath('PCEE2-REVISION.txt'), 'utf8').trim();
+    return /^[a-f\d]{40}$/i.test(revision) ? revision : null;
+  } catch { return null; }
+}
+
+function stopMacPlayerAndDetach() {
+  macLaunchGeneration++;
+  try { macLibretroHost?.stop(); } catch (error) { console.warn('[kente] Mac core cleanup:', error.message); }
+  try { macLibretroHost?.setPlayerView(null); } catch (error) { console.warn('[kente] Mac frame target cleanup:', error.message); }
+  try { macPlayerSurface?.detach(); } catch (error) { console.warn('[kente] Mac surface cleanup:', error.message); }
+}
+
+ipcMain.on('kente:mac-player:available', event => {
+  if (process.platform !== 'darwin' || !macPlayerSurface || !macLibretroHost) {
+    event.returnValue = false;
+    return;
+  }
+  try {
+    // Validate the packaged core, runtime-loaded Vulkan dependency, and
+    // required PCSX2 resources before advertising PS2 support in the UI.
+    const runtimeResources = macPcee2ResourcePath('runtime-resources');
+    event.returnValue = !!macPcee2Revision()
+      && fs.existsSync(path.join(runtimeResources, 'GameIndex.yaml'))
+      && macLibretroHost.probeCore(macPcee2ResourcePath('pcee2_libretro.dylib')) === true;
+  } catch (error) {
+    console.error('[kente] Packaged Mac emulator core is unavailable:', error.message);
+    event.returnValue = false;
+  }
+});
+
+ipcMain.handle('kente:mac-player:mount', async (event, rect) => {
+  if (!isPlayerSender(event) || process.platform !== 'darwin' || !macPlayerSurface) {
+    return { success: false, error: 'MAC_PLAYER_UNAVAILABLE' };
+  }
+  if (!rect || typeof rect !== 'object') return { success: false, error: 'INVALID_PLAYER_BOUNDS' };
+  const handle = mainWindow.getNativeWindowHandle();
+  const [width, height] = mainWindow.getContentSize();
+  try {
+    if (!macPlayerSurface.mount(handle, { ...rect, hostWidth: width, hostHeight: height }))
+      return { success: false, error: 'MAC_PLAYER_MOUNT_FAILED' };
+    if (!macLibretroHost?.setPlayerView(macPlayerSurface.viewHandle())) {
+      stopMacPlayerAndDetach();
+      return { success: false, error: 'MAC_PLAYER_MOUNT_FAILED' };
+    }
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: 'MAC_PLAYER_MOUNT_FAILED', message: error.message };
+  }
+});
+
+ipcMain.handle('kente:mac-player:resize', (event, rect) => {
+  if (!isPlayerSender(event) || process.platform !== 'darwin' || !macPlayerSurface) return false;
+  return macPlayerSurface.resize(rect);
+});
+
+ipcMain.handle('kente:mac-player:present', (event, rgba, width, height) => {
+  if (!isPlayerSender(event) || process.platform !== 'darwin' || !macPlayerSurface
+      || !Buffer.isBuffer(rgba)) return false;
+  return macPlayerSurface.present(rgba, width, height);
+});
+
+ipcMain.handle('kente:mac-player:detach', event => {
+  if (!isPlayerSender(event) || process.platform !== 'darwin' || !macPlayerSurface) return false;
+  stopMacPlayerAndDetach();
+  return true;
+});
+
+ipcMain.handle('kente:mac-player:import-bios', async (event, payload) => {
+  if (!isPlayerSender(event) || process.platform !== 'darwin')
+    return { success: false, error: 'MAC_PLAYER_UNAVAILABLE' };
+  let bytes = null;
+  if (payload instanceof ArrayBuffer) bytes = Buffer.from(payload);
+  else if (ArrayBuffer.isView(payload))
+    bytes = Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength);
+  if (!bytes || bytes.length < 1_000_000 || bytes.length > 16 * 1024 * 1024)
+    return { success: false, error: 'INVALID_PS2_BIOS', message: 'Choose a PS2 BIOS file between 1 MB and 16 MB.' };
+
+  const biosRoot = path.join(app.getPath('userData'), 'KenteCorner', 'bios');
+  const target = path.join(biosRoot, 'scph39001.bin');
+  const temporary = path.join(biosRoot, `.scph39001-${randomUUID()}.tmp`);
+  try {
+    await fs.promises.mkdir(biosRoot, { recursive: true });
+    await fs.promises.writeFile(temporary, bytes, { flag: 'wx', mode: 0o600 });
+    await fs.promises.rename(temporary, target);
+    return { success: true, filename: path.basename(target) };
+  } catch (error) {
+    await fs.promises.unlink(temporary).catch(() => {});
+    return { success: false, error: 'PS2_BIOS_IMPORT_FAILED', message: error.message };
+  }
+});
+
+ipcMain.handle('kente:mac-player:launch', async (event, game, rect) => {
+  if (!isPlayerSender(event) || process.platform !== 'darwin' || !macLibretroHost || !macPlayerSurface)
+    return { success: false, error: 'MAC_PLAYER_UNAVAILABLE' };
+  if (!game || game.systemId !== 'ps2' || typeof game.title !== 'string'
+      || typeof game.sessionId !== 'string')
+    return { success: false, error: 'UNSUPPORTED_MAC_SYSTEM' };
+  if (!rect || typeof rect !== 'object') return { success: false, error: 'INVALID_PLAYER_BOUNDS' };
+  const launchGeneration = ++macLaunchGeneration;
+  const isCancelled = () => launchGeneration !== macLaunchGeneration;
+  const coreRevision = macPcee2Revision();
+  if (!coreRevision) return { success: false, error: 'MAC_CORE_MISSING', message: 'The packaged PS2 core revision is invalid.' };
+  const corePath = macPcee2ResourcePath('pcee2_libretro.dylib');
+  if (!fs.existsSync(corePath)) return { success: false, error: 'MAC_CORE_MISSING' };
+  try {
+    const dataRoot = path.resolve(app.getPath('userData'), 'KenteCorner');
+    const biosSource = path.join(dataRoot, 'bios');
+    const validBios = fs.existsSync(biosSource) && fs.readdirSync(biosSource).some(name => {
+      const file = path.join(biosSource, name);
+      return name.toLowerCase().endsWith('.bin') && fs.statSync(file).isFile()
+        && fs.statSync(file).size >= 1_000_000;
+    });
+    if (!validBios) return { success: false, error: 'PS2_BIOS_MISSING' };
+    let resolved = await nativePlayerRequest(`/api/rom/resolve?${new URLSearchParams({
+      systemId: game.systemId, title: game.title, ...(game.filename ? { filename: game.filename } : {}),
+    })}`, null, 5000);
+    if (isCancelled()) return { success: false, error: 'MAC_PLAYER_CANCELLED' };
+    if (!resolved.found || !resolved.filename) return { success: false, error: 'ROM_NOT_FOUND' };
+    const prepared = await nativePlayerRequest('/api/rom/prepare', {
+      systemId: game.systemId, filename: resolved.filename,
+    }, 30 * 60 * 1000);
+    if (isCancelled()) return { success: false, error: 'MAC_PLAYER_CANCELLED' };
+    if (!prepared.success || !prepared.path)
+      return { success: false, error: prepared.error || 'ROM_NOT_FOUND', message: prepared.message };
+    const romPath = path.resolve(prepared.path);
+    if (!romPath.startsWith(dataRoot + path.sep))
+      return { success: false, error: 'ROM_NOT_FOUND' };
+    // PCSX2 resources are version-matched to the core. Isolate them per pinned
+    // revision so an app update cannot silently reuse stale resources.
+    const systemDir = path.join(dataRoot, 'system', `pcee2-${coreRevision}`);
+    const saveDir = path.join(dataRoot, 'saves', 'ps2');
+    const biosDir = path.join(systemDir, 'pcsx2', 'bios');
+    const pcsx2Dir = path.join(systemDir, 'pcsx2');
+    const runtimeResources = path.join(pcsx2Dir, 'resources');
+    const bundledResources = macPcee2ResourcePath('runtime-resources');
+    fs.mkdirSync(pcsx2Dir, { recursive: true });
+    // Merge on every launch: a prior partial resource install must not leave
+    // PCEE2 without required files. Existing user-provided files remain intact.
+    fs.cpSync(bundledResources, runtimeResources, { recursive: true, force: false, errorOnExist: false });
+    fs.mkdirSync(path.dirname(biosDir), { recursive: true });
+    fs.mkdirSync(runtimeResources, { recursive: true });
+    fs.mkdirSync(biosDir, { recursive: true });
+    for (const name of fs.readdirSync(biosSource)) {
+      const source = path.join(biosSource, name);
+      const target = path.join(biosDir, name);
+      if (name.toLowerCase().endsWith('.bin') && fs.statSync(source).isFile()
+          && (!fs.existsSync(target) || name.toLowerCase() === 'scph39001.bin'))
+        fs.copyFileSync(source, target);
+    }
+    if (isCancelled()) return { success: false, error: 'MAC_PLAYER_CANCELLED' };
+    if (!macPlayerSurface.mount(mainWindow.getNativeWindowHandle(), rect))
+      return { success: false, error: 'MAC_PLAYER_MOUNT_FAILED' };
+    const frameTarget = macPlayerSurface.viewHandle();
+    if (!Buffer.isBuffer(frameTarget) || !macLibretroHost.setPlayerView(frameTarget)) {
+      stopMacPlayerAndDetach();
+      return { success: false, error: 'MAC_PLAYER_MOUNT_FAILED' };
+    }
+    const started = macLibretroHost.start({ corePath, gamePath: romPath, systemDir, saveDir });
+    if (!started) {
+      stopMacPlayerAndDetach();
+      return { success: false, error: 'MAC_PLAYER_START_FAILED' };
+    }
+    return { success: true, filename: resolved.filename };
+  } catch (error) {
+    if (isCancelled()) return { success: false, error: 'MAC_PLAYER_CANCELLED' };
+    stopMacPlayerAndDetach();
+    return { success: false, error: 'MAC_PLAYER_START_FAILED', message: error.message };
+  }
+});
+
+ipcMain.handle('kente:mac-player:status', event => {
+  if (!isPlayerSender(event) || !macLibretroHost) return { running: false };
+  return macLibretroHost.status();
+});
+
+ipcMain.handle('kente:mac-player:control', (event, action, rect) => {
+  if (!isPlayerSender(event) || !macLibretroHost) return { success: false };
+  if (action === 'stop') {
+    stopMacPlayerAndDetach();
+    return { success: true };
+  }
+  if (action === 'pause' || action === 'resume') {
+    const success = macLibretroHost.setPaused(action === 'pause');
+    if (!success) return { success: false };
+    if (macPlayerSurface?.setVisible(action === 'resume')) return { success: true };
+    // Do not report a successful transition if the AppKit surface could not
+    // reveal the HUD or restore the video. Best-effort rollback keeps the core
+    // and shared menu state aligned with the visible native surface.
+    macLibretroHost.setPaused(action === 'resume');
+    return { success: false };
+  }
+  if (action === 'resize') return { success: !!macPlayerSurface?.resize(rect) };
+  return { success: false };
+});
+
+ipcMain.on('kente:mac-player:input', (event, buttons, axes) => {
+  if (!isPlayerSender(event) || !macLibretroHost || !Number.isInteger(buttons) || !Array.isArray(axes)) return;
+  macLibretroHost.setInput(buttons, axes);
+});
+
+ipcMain.handle('kente:mac-player:change-disc', (event, direction) => {
+  if (!isPlayerSender(event) || process.platform !== 'darwin' || !macLibretroHost
+      || !Number.isInteger(direction) || (direction !== -1 && direction !== 1))
+    return { success: false };
+  return { success: macLibretroHost.changeDisc(direction) === true };
+});
 
 ipcMain.handle('kente:native:launch', async (event, game, rect) => {
   if (!isPlayerSender(event) || process.platform !== 'win32') return { success: false, error: 'NATIVE_UNAVAILABLE' };
@@ -381,10 +608,8 @@ ipcMain.on('kente:showWindow', event => {
 });
 
 /**
- * Renderer → main: toggle the "theater is on screen" flag. While true,
- * setWindowOpenHandler refuses to forward URLs to the system browser and
- * will-navigate blocks any non-localhost top-frame navigation. This is
- * what stops embed-iframe ad scripts from popping the user's browser.
+ * Renderer compatibility state. Popup denial and localhost-only top-frame
+ * navigation are enforced unconditionally by the BrowserWindow handlers.
  */
 ipcMain.on('kente:theater:setActive', (event, active) => {
   if (!isPlayerSender(event)) return;
@@ -626,4 +851,8 @@ app.on('before-quit', event => {
   nativePlayerRequest('/api/native/control', { action: 'stop' }, 5000)
     .catch(() => {}).finally(() => app.quit());
 });
-app.on('will-quit', () => { killServer(); destroyDiscord(); });
+app.on('will-quit', () => {
+  stopMacPlayerAndDetach();
+  killServer();
+  destroyDiscord();
+});

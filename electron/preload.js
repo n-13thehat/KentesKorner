@@ -9,12 +9,26 @@
  */
 
 const { contextBridge, ipcRenderer } = require('electron');
+const macNativeCoreAvailable = process.platform === 'darwin'
+  && ipcRenderer.sendSync('kente:mac-player:available') === true;
 
 contextBridge.exposeInMainWorld('electronAPI', {
   /** True when KenteCorner is running as a packaged desktop app. */
   isElectron: true,
 
   nativePlayerSupported: process.platform === 'win32',
+  macNativeSurfaceAvailable: process.platform === 'darwin',
+  macNativeCoreAvailable,
+  mountMacPlayerSurface: rect => ipcRenderer.invoke('kente:mac-player:mount', rect),
+  resizeMacPlayerSurface: rect => ipcRenderer.invoke('kente:mac-player:resize', rect),
+  presentMacPlayerFrame: (rgba, width, height) => ipcRenderer.invoke('kente:mac-player:present', rgba, width, height),
+  detachMacPlayerSurface: () => ipcRenderer.invoke('kente:mac-player:detach'),
+  importMacPs2Bios: bytes => ipcRenderer.invoke('kente:mac-player:import-bios', bytes),
+  launchMacNativePlayer: (game, rect) => ipcRenderer.invoke('kente:mac-player:launch', game, rect),
+  macNativePlayerStatus: () => ipcRenderer.invoke('kente:mac-player:status'),
+  controlMacNativePlayer: (action, rect) => ipcRenderer.invoke('kente:mac-player:control', action, rect),
+  changeMacNativePlayerDisc: direction => ipcRenderer.invoke('kente:mac-player:change-disc', direction),
+  setMacNativePlayerInput: (buttons, axes) => ipcRenderer.send('kente:mac-player:input', buttons, axes),
   checkForUpdates: () => ipcRenderer.invoke('kente:update:check'),
   launchNativePlayer: (game, rect) => ipcRenderer.invoke('kente:native:launch', game, rect),
   nativePlayerStatus: () => ipcRenderer.invoke('kente:native:status'),

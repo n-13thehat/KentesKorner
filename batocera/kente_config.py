@@ -63,14 +63,29 @@ EJS_STABLE_DIR = CACHE_DIR / 'ejs-stable'   # offline mirror + write-through CDN
 # user cache is populated.
 EJS_SEED_DIR   = WEB_DIR / 'cache' / 'ejs-stable'
 
-# Flycast (Dreamcast) — built by nasomers/flycast-wasm (github.com/nasomers/flycast-wasm)
-# The stable CDN doesn't host this core.  We serve it from a local cache and
-# download it on first request.  Both the "wasm" and "legacy-wasm" names are
-# mapped to the same WebGL2 file so EJS works regardless of its requiresWebGL2
-# flag (Flycast is not in EJS's built-in list, so EJS requests the legacy name).
+# Flycast (Dreamcast) — built by nasomers/flycast-wasm (github.com/nasomers/flycast-wasm).
+# EmulatorJS requests a ZIP-style .data bundle; upstream publishes pinned JS and
+# WASM assets separately. The API assembles and verifies that bundle on demand.
+_FLYCAST_RELEASE = 'https://github.com/nasomers/flycast-wasm/releases/download/v1.0'
+_FLYCAST_ASSETS = {
+    'flycast_libretro.js': (
+        f'{_FLYCAST_RELEASE}/flycast_libretro.js',
+        '1f2ae9afafa85c8ff577ca3961be0343c2ac394ddc79285981f0d55ad75dbd7b',
+    ),
+    'flycast_libretro.wasm': (
+        f'{_FLYCAST_RELEASE}/flycast_libretro.wasm',
+        'db2b87d8d2742087a56c4eeed317da14e3549ee037e36de3d77c1e6e5291bead',
+    ),
+}
+_FLYCAST_CORE_METADATA = {
+    'name': 'flycast',
+    'extensions': ['cdi', 'gdi', 'chd', 'cue', 'iso', 'elf', 'bin', 'lst', 'zip', '7z', 'dat'],
+    'options': {}, 'save': 'state', 'license': 'GPLv2',
+    'repo': 'https://github.com/flyinghead/flycast',
+}
 COMMUNITY_CORES = {
-    'flycast-wasm.data':        'https://github.com/nasomers/flycast-wasm/releases/download/v1.0.0/flycast-wasm.data',
-    'flycast-legacy-wasm.data': 'https://github.com/nasomers/flycast-wasm/releases/download/v1.0.0/flycast-wasm.data',
+    'flycast-wasm.data': _FLYCAST_ASSETS,
+    'flycast-legacy-wasm.data': _FLYCAST_ASSETS,
 }
 
 # Kente systemId → Batocera ROM folder name

@@ -18,11 +18,15 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
+import io
+import json
 import os
 import sys
 import time
 import urllib.error
 import urllib.request
+import zipfile
 from pathlib import Path
 
 
@@ -70,6 +74,26 @@ REQUIRED_CORES = [
     "ppsspp",
 ]
 
+FLYCAST_RELEASE = "https://github.com/nasomers/flycast-wasm/releases/download/v1.0"
+COMMUNITY_CORE_ASSETS = {
+    "flycast_libretro.js": (
+        f"{FLYCAST_RELEASE}/flycast_libretro.js",
+        "1f2ae9afafa85c8ff577ca3961be0343c2ac394ddc79285981f0d55ad75dbd7b",
+    ),
+    "flycast_libretro.wasm": (
+        f"{FLYCAST_RELEASE}/flycast_libretro.wasm",
+        "db2b87d8d2742087a56c4eeed317da14e3549ee037e36de3d77c1e6e5291bead",
+    ),
+}
+FLYCAST_CORE_METADATA = {
+    "name": "flycast",
+    "extensions": ["cdi", "gdi", "chd", "cue", "iso", "elf", "bin", "lst", "zip", "7z", "dat"],
+    "options": {},
+    "save": "state",
+    "license": "GPLv2",
+    "repo": "https://github.com/flyinghead/flycast",
+}
+
 
 def _download(url: str, dest: Path, timeout: int = 600) -> bool:
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -93,11 +117,35 @@ def _download(url: str, dest: Path, timeout: int = 600) -> bool:
             pass
 
 
+def _download_community_core(dest: Path) -> bool:
+    """Build the EmulatorJS .data ZIP from Flycast's pinned JS/WASM release."""
+    assets: dict[str, bytes] = {}
+    for name, (url, expected_sha256) in COMMUNITY_CORE_ASSETS.items():
+        request = urllib.request.Request(url, headers={"User-Agent": "KenteKorner/1.0"})
+        with urllib.request.urlopen(request, timeout=600) as response:
+            payload = response.read()
+        actual_sha256 = hashlib.sha256(payload).hexdigest()
+        if actual_sha256 != expected_sha256:
+            raise ValueError(f"{name} checksum mismatch: expected {expected_sha256}, got {actual_sha256}")
+        assets[name] = payload
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    temporary = dest.with_name(dest.name + ".tmp")
+    with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as bundle:
+        for name, payload in assets.items():
+            bundle.writestr(name, payload)
+        bundle.writestr("core.json", json.dumps(FLYCAST_CORE_METADATA, separators=(",", ":")))
+    temporary.replace(dest)
+    return True
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--version", default="stable", help="CDN version: stable|latest|nightly|<tag>")
     ap.add_argument("--base", default=None, help="Override CDN base URL (must end with /data/)")
     ap.add_argument("--dest", default=str(Path("cache") / "ejs-stable"), help="Output directory")
+    ap.add_argument("--strict", action="store_true",
+                    help="Fail unless the required runtime files and at least one archive per core are present")
     args = ap.parse_args(argv)
 
     base = (args.base or DEFAULT_BASE.format(version=args.version)).strip()
@@ -123,6 +171,21 @@ def main(argv: list[str]) -> int:
             todo.append(f"cores/{c}{suffix}")
         if c == "ppsspp":
             todo.append("cores/ppsspp-assets.zip")
+        todo.append(f"cores/reports/{c}.json")
+
+    # Dreamcast is not hosted by the EmulatorJS CDN; stage its community core
+    # separately so packaged desktop builds do not need a first-launch download.
+    community_dest = dest_root.parent / "ejs-cores"
+    community_failures: list[str] = []
+    community_name = "flycast-wasm.data"
+    community_target = community_dest / community_name
+    if not community_target.is_file() or community_target.stat().st_size == 0:
+        try:
+            _download_community_core(community_target)
+            print(f"[ejs-pack] OK   {community_name} (assembled from pinned upstream JS/WASM assets)")
+        except Exception as e:
+            community_failures.append(community_name)
+            print(f"[ejs-pack] FAIL {community_name}: {e}")
 
     # De-dupe
     seen: set[str] = set()
@@ -140,7 +203,7 @@ def main(argv: list[str]) -> int:
     for i, rel in enumerate(todo2, 1):
         url = base + rel
         dest = dest_root / rel.replace("/", os.sep)
-        if dest.exists():
+        if dest.is_file() and dest.stat().st_size > 0:
             ok += 1
             continue
         try:
@@ -153,6 +216,30 @@ def main(argv: list[str]) -> int:
                 print(f"[{i:>3}/{len(todo2)}] 404  {rel} (skipped)")
         except Exception as e:
             print(f"[{i:>3}/{len(todo2)}] FAIL {rel}: {e}")
+
+    if args.strict:
+        missing = [rel for rel in REQUIRED_FILES
+                   if not (dest_root / rel).is_file() or (dest_root / rel).stat().st_size == 0]
+        for core in REQUIRED_CORES:
+            variants = [dest_root / "cores" / f"{core}{suffix}" for suffix in (
+                "-wasm.data", "-legacy-wasm.data", "-thread-wasm.data", "-thread-legacy-wasm.data")]
+            if not any(path.is_file() and path.stat().st_size > 0 for path in variants):
+                missing.append(f"cores/{core} (no usable archive variant)")
+            report = dest_root / "cores" / "reports" / f"{core}.json"
+            if not report.is_file() or report.stat().st_size == 0:
+                missing.append(f"cores/reports/{core}.json")
+        ppsspp_assets = dest_root / "cores" / "ppsspp-assets.zip"
+        if not ppsspp_assets.is_file() or ppsspp_assets.stat().st_size == 0:
+            missing.append("cores/ppsspp-assets.zip")
+        missing.extend(f"cache/ejs-cores/{name}" for name in community_failures)
+        if not community_target.is_file() or community_target.stat().st_size == 0:
+            missing.append(f"cache/ejs-cores/{community_name}")
+        missing = list(dict.fromkeys(missing))
+        if missing:
+            print("[ejs-pack] ERROR: installer runtime is incomplete:")
+            for rel in missing:
+                print(f"  - {rel}")
+            return 1
 
     dur = time.time() - start
     print(f"[ejs-pack] Done in {dur:.1f}s. downloaded={ok}, skipped_404={skipped_404}")

@@ -486,6 +486,12 @@ const DownloadManager = (() => {
 
       if (isTransient && item._attempt < MAX_AUTO_RETRIES) {
         const wait = RETRY_DELAY_MS * item._attempt;
+        // A retry starts a fresh HTTP body; don't count bytes from its failed
+        // predecessor against the next response's Content-Length.
+        item.progress = 0;
+        item.total = 0;
+        item._lastBytes = 0;
+        item._lastTime = Date.now();
         item.status = 'queued';  // show as queued again while waiting
         item.error  = null;
         _notify();

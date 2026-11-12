@@ -56,13 +56,13 @@ function gameCard(g, extraStyle = '', extraAttrs = '') {
   const needsNative = !isFlash && !CORE_MAP[g.systemId];
 
   // ROM availability dot — green when the user can play, grey when ROM is missing
-  const hasRom    = isFlash || KENTE_SERVER_ONLINE || !!ROM_STATUS[g.id];
+  const hasRom    = isFlash || !!ROM_STATUS[g.id];
   const dotActive = isFlash || KENTE_SERVER_ONLINE || Object.keys(ROM_STATUS).length > 0;
   const dotClass  = dotActive ? (hasRom ? 'game-card-rom-dot found' : 'game-card-rom-dot') : 'game-card-rom-dot hidden';
 
   // NATIVE badge — shown on cards that can't run in browser mode
   const nativeBadge = needsNative
-    ? `<div class="game-card-native-badge" title="REQUIRES NATIVE MODE (KENTE SERVER)">⚙ NATIVE</div>`
+    ? `<div class="game-card-native-badge" title="${NativePlayer.supported(g.systemId) || serverIsBatocera ? 'Requires a native emulator on this host' : 'Native launch is unavailable in this macOS/browser build'}">⚙ NATIVE</div>`
     : '';
 
   // Favorite star — gold when the game is in the favorites list

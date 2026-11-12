@@ -10,6 +10,9 @@ resources/dolphin/
 resources/kente-server.exe
 resources/emulators/
 resources/runtime-dlls/
+electron/native/mac-player.node
+electron/native/mac-libretro.node
+electron/native/macos/build/
 
 # ── User data (lives in %APPDATA%/KenteCorner/ at runtime) ──────────────────
 roms/

@@ -1,16 +1,19 @@
 {
   "name": "kentecorner",
-  "version": "8.3.2",
+  "version": "9.1.9",
   "description": "Kente's Korner — Retro Game Room",
   "main": "electron/main.js",
   "scripts": {
     "start": "electron .",
     "build": "electron-builder --win nsis",
-    "build:mac": "npm run build:server && electron-builder --mac dmg zip",
-    "prebuild": "npm run build:server && npm run build:runtimes",
-    "build:server": "pyinstaller --onefile --name kente-server --distpath resources batocera/kente-server.py",
+    "build:mac": "npm run fetch:ejs:installer && npm run build:mac:native && npm run fetch:mac:pcee2 && npm run build:server && electron-builder --mac dmg zip",
+    "build:mac:native": "node-gyp rebuild --directory electron/native/macos --target=41.1.1 --runtime=electron --dist-url=https://electronjs.org/headers && node scripts/stage-mac-native.mjs",
+    "fetch:mac:pcee2": "node scripts/fetch-mac-pcee2.mjs",
+    "prebuild": "npm run fetch:ejs:installer && npm run build:server && npm run build:runtimes",
+    "build:server": "pyinstaller --onefile --name kente-server --distpath resources --paths batocera --hidden-import rom_providers --hidden-import theater_providers batocera/kente-server.py",
     "build:runtimes": "python scripts/prepare-runtimes.py",
     "fetch:ejs": "python fetch-emulatorjs-pack.py",
+    "fetch:ejs:installer": "python fetch-emulatorjs-pack.py --strict",
     "check:syntax": "node scripts/check-syntax.mjs",
     "test": "npm run test:js && npm run test:py",
     "test:js": "node --test tests/*.test.mjs",
@@ -18,10 +21,12 @@
   },
   "devDependencies": {
     "electron": "~41.1.1",
-    "electron-builder": "~26.8.1"
+    "electron-builder": "~26.8.1",
+    "node-gyp": "11.5.0"
   },
   "dependencies": {
     "discord-rpc": "^4.0.1",
-    "electron-updater": "~6.8.3"
+    "electron-updater": "~6.8.3",
+    "node-addon-api": "1.7.2"
   }
 }

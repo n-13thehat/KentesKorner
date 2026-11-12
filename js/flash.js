@@ -243,6 +243,14 @@ async function launchFlashGame(game) {
     } catch { /* server not running — use web fallback */ }
   }
 
+  // Packaged desktop builds only run bundled game assets. Do not silently
+  // load a provider website inside the app if a local SSF asset is missing.
+  if (!isLocal && window.electronAPI?.isElectron) {
+    loader.innerHTML = '<div style="color:#888">LOCAL GAME ASSET NOT FOUND. REPAIR OR REINSTALL KENTE\'S KORNER.</div>';
+    cloudBadge.textContent = '⚠ LOCAL ASSET MISSING';
+    return;
+  }
+
   cloudBadge.textContent = isLocal ? '⚡ LOCAL' : '⚡ WEB';
   if (!isLocal) showToast('ℹ RUN kente-server.py FOR LOCAL FLASH MODE');
 
@@ -281,22 +289,15 @@ async function launchFlashGame(game) {
       : '🎮 CONTROLLER READY — CLICK GAME IF INPUT DOESN\'T RESPOND');
   }, { once: true });
 
-  // 12 s fallback — offer "OPEN IN NEW TAB" if embed is blocked or stalled
+  // 12 s fallback — keep failures inside the standalone app.
   const fallbackTimer = setTimeout(() => {
     if (!loader.isConnected) return;
-    const webHref = escHtml(game.flashUrl);
     loader.innerHTML = `
       <div style="color:#888;margin-bottom:8px">
-        ${isLocal ? 'LOCAL SERVER STALLED' : 'EMBED BLOCKED OR LOADING SLOWLY'}
+        ${isLocal ? 'LOCAL GAME IS TAKING TOO LONG TO LOAD' : 'LOCAL GAME CONTENT IS UNAVAILABLE'}
       </div>
-      <a href="${webHref}" target="_blank" rel="noopener"
-         style="padding:10px 20px;background:var(--brand,#e8a000);color:#000;
-                font-family:var(--font-mono);font-size:11px;letter-spacing:.15em;
-                text-decoration:none">
-        ⬡ OPEN IN NEW TAB
-      </a>
       <div style="font-size:9px;color:#444;margin-top:8px">
-        (THEN CLOSE THIS OVERLAY WITH ✕)
+        CLOSE THIS SESSION AND CHECK THE APP'S LOCAL GAME ASSETS.
       </div>`;
   }, 12000);
 
@@ -304,10 +305,22 @@ async function launchFlashGame(game) {
   container.appendChild(iframe);
 }
 
+function _stopEmulatorJS() {
+  const emulator = window.EJS_emulator;
+  try { window.EJS_terminate?.(); } catch (e) {
+    console.warn('[EJS] Termination hook warning:', e);
+  }
+  try { emulator?.gameManager?.toggleMainLoop?.(false); } catch {}
+  try { emulator?.gameManager?.worker?.terminate?.(); } catch {}
+  try { emulator?.gameManager?.Module?.quit?.(); } catch {}
+  try { emulator?.Module?.quit?.(); } catch {}
+  delete window.EJS_terminate;
+}
+
 async function closeGame() {
   // The embedded Windows player owns its process lifetime. Stop it through
   // the session API so the emulator can flush saves before Kente clears the HUD.
-  if (window.electronAPI?.nativePlayerSupported && NativePlayer.active) {
+  if (NativePlayer.active) {
     await NativePlayer.stop();
     exitEmulator();
     return;
@@ -335,14 +348,7 @@ async function closeGame() {
 
   // Clean up browser-based emulator (EmulatorJS)
   _cancelEjsStartup?.();
-  try {
-    if (window.EJS_emulator) {
-      window.EJS_emulator.gameManager?.worker?.terminate?.();
-      window.EJS_emulator.Module?.quit?.();
-    }
-  } catch (e) {
-    console.warn('[closeGame] EJS cleanup warning:', e);
-  }
+  _stopEmulatorJS();
   delete window.EJS_emulator;
   delete window.EJS_ready;
   delete window.EJS_onGameStart;
@@ -395,14 +401,7 @@ function exitEmulator() {
   // ── Terminate the old EmulatorJS instance ──
   // Without this, the old WebWorker + WebGL context stay alive and fight
   // the next EJS instance for the same #ejs-container → black screen.
-  try {
-    if (window.EJS_emulator) {
-      window.EJS_emulator.gameManager?.worker?.terminate?.();
-      window.EJS_emulator.Module?.quit?.();
-    }
-  } catch (e) {
-    console.warn('[EJS] Cleanup warning:', e);
-  }
+  _stopEmulatorJS();
   delete window.EJS_emulator;
   delete window.EJS_ready;
   delete window.EJS_onGameStart;

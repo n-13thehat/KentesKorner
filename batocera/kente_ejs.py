@@ -136,7 +136,8 @@ def _ejs_locate_core(core_name: str):
     """Find a cached *.data core file across the user, seed, and community dirs."""
     if not core_name or not _EJS_CORE_NAME_RE.match(core_name):
         return None
-    for root in (EJS_STABLE_DIR / 'cores', EJS_SEED_DIR / 'cores', EJS_CORES_DIR):
+    for root in (EJS_STABLE_DIR / 'cores', EJS_SEED_DIR / 'cores',
+                 EJS_SEED_DIR.parent / 'ejs-cores', EJS_CORES_DIR):
         try:
             p = root / core_name
             if p.is_file():

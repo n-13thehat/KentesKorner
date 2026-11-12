@@ -356,7 +356,7 @@ function openRomPickerForGame(game) {
    romHandle is saved so launch can continue
    automatically once the BIOS is picked.
 ══════════════════════════════════════════ */
-function showBiosPicker(game, romHandle, biosReq) {
+function showBiosPicker(game, romHandle, biosReq, continueLaunch = null) {
   const tv     = TV_ZONES.find(t => t.id === state.activeMenu);
   const accent = tv?.accent || 'var(--brand)';
 
@@ -392,16 +392,23 @@ function showBiosPicker(game, romHandle, biosReq) {
   document.getElementById('bios-pick-btn').addEventListener('click', () => {
     overlay.classList.remove('active');
     const input = document.getElementById('rom-file-input');
-    input.accept = '';
+    const isMacNativePs2 = game.systemId === 'ps2' && window.electronAPI?.macNativeCoreAvailable;
+    input.accept = isMacNativePs2 ? '.bin,application/octet-stream' : '';
     input.onchange = async () => {
       const file = input.files[0];
       if (!file) return;
       input.value = '';
-      const tempHandle = { getFile: async () => file, kind: 'file' };
       try {
-        await BiosDB.set(game.systemId, tempHandle, biosReq.filename);
+        if (isMacNativePs2) {
+          const imported = await window.electronAPI.importMacPs2Bios(await file.arrayBuffer());
+          if (!imported?.success) throw new Error(imported?.message || imported?.error || 'Could not save the PS2 BIOS file.');
+        } else {
+          const tempHandle = { getFile: async () => file, kind: 'file' };
+          await BiosDB.set(game.systemId, tempHandle, biosReq.filename);
+        }
         showToast(`✓ ${biosReq.label.toUpperCase()} SAVED`);
-        if (CORE_MAP[game.systemId]) launchWithEmulatorJS(game, romHandle);
+        if (continueLaunch) await continueLaunch();
+        else if (CORE_MAP[game.systemId]) launchWithEmulatorJS(game, romHandle);
         else launchGame(game);
       } catch (error) { showToast('⚠ ' + error.message); }
     };
@@ -429,6 +436,17 @@ function showNativeModeRequired(game) {
   const accent = tv?.accent || 'var(--brand)';
   const overlay = document.getElementById('launch-overlay');
   const con     = document.getElementById('launch-content');
+  const isMacApp = serverIsElectron && serverPlatform === 'Darwin';
+  const hasMacPs2Player = window.electronAPI?.macNativeCoreAvailable === true;
+  const platformMessage = isMacApp
+    ? game.systemId === 'ps2' && hasMacPs2Player
+      ? 'THIS MAC APP INCLUDES EXPERIMENTAL IN-APP PLAYSTATION 2 SUPPORT. LAUNCH THE GAME FROM THE MAC DESKTOP APP WITH A VALID PS2 BIOS.'
+      : game.systemId === 'ps2'
+        ? 'THE IN-APP PLAYSTATION 2 CORE IS NOT AVAILABLE IN THIS MAC APP BUILD. INSTALL THE CURRENT MAC APP BUILD AND ADD A VALID PS2 BIOS.'
+        : `THIS MAC APP CURRENTLY SUPPORTS EXPERIMENTAL IN-APP PLAYSTATION 2 ONLY. ${emu} IS NOT AVAILABLE ON MAC YET. PLAY THIS SYSTEM ON A BATOCERA DEVICE OR A WINDOWS DESKTOP.`
+    : serverIsElectron
+      ? `THIS DESKTOP BUILD DOES NOT INCLUDE AN IN-APP ${emu} PLAYER. PLAY THIS SYSTEM ON A BATOCERA DEVICE OR A WINDOWS DESKTOP WITH ITS NATIVE EMULATOR.`
+      : `THIS BROWSER BUILD DOES NOT INCLUDE AN IN-APP ${emu} PLAYER. RUN KENTE ON A BATOCERA DEVICE OR A DESKTOP APP WITH NATIVE SUPPORT.`;
   overlay.style.setProperty('--menu-accent', accent);
   overlay.classList.add('active');
 
@@ -441,9 +459,7 @@ function showNativeModeRequired(game) {
                 max-width:400px">
       <strong style="color:var(--white)">${(game.system || game.systemId || '').toUpperCase()}</strong> CANNOT RUN IN BROWSER MODE.<br>
       NO WEBASSEMBLY CORE IS AVAILABLE FOR THIS SYSTEM.<br><br>
-      TO PLAY, RUN THE KENTE SERVER ON YOUR BATOCERA DEVICE:<br>
-      <span style="color:var(--brand)">python batocera/kente-server.py</span><br>
-      IT WILL BE DETECTED AUTOMATICALLY ON THE NEXT PAGE LOAD.
+      ${platformMessage}
     </div>
     <button class="launch-dismiss" style="margin-top:18px">✕ CLOSE</button>`;
 }

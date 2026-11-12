@@ -512,10 +512,14 @@ async function launchFromDownloadCenter(dlid) {
 
   const game = findGameForDownload(item.game.systemId, item.filename) || item.game;
 
-  if (serverIsBatocera || (KENTE_SERVER_ONLINE && NativePlayer.supported())) {
+  // Keep browser-core systems (including N64) in EmulatorJS on desktop even
+  // when the Electron app can host native players. NativePlayer only handles
+  // systems registered in kente_runtime.SYSTEM_ENGINES; routing every download
+  // there produced "No native engine is configured" for N64 and other cores.
+  if (serverIsBatocera || (KENTE_SERVER_ONLINE && NativePlayer.supported(game.systemId) && !CORE_MAP[game.systemId])) {
     // Server downloads are saved under its configured ROMS_DIR
     // (/userdata/roms on Batocera, or the app's local data/roms folder).
-    launchNative(game, true);
+    launchNative(game, true, false, false, { filename: item.filename });
     return;
   }
 
@@ -566,8 +570,8 @@ async function launchFromDownloadCenter(dlid) {
   // Native-only system on non-Batocera host.
   // The ROM was streamed through the server proxy and saved to roms/<system>/.
   // Use launchNative → /api/launch → find_rom() → native emulator (Dolphin, PCSX2, etc.)
-  if (KENTE_SERVER_ONLINE) {
-    launchNative(game, true);
+  if (serverIsBatocera || NativePlayer.supported(game.systemId)) {
+    launchNative(game, true, false, false, { filename: item.filename });
   } else {
     showNativeModeRequired(game);
   }

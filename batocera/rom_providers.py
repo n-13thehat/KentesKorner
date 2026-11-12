@@ -62,7 +62,7 @@ ROM_EXT = {
     'atari7800':  ['.a78', '.bin', '.zip'],
     'n64':        ['.n64', '.z64', '.v64', '.zip'],
     'ps1':        ['.cue', '.bin', '.chd', '.iso', '.pbp', '.zip', '.7z'],
-    'ps2':        ['.iso', '.chd', '.bin', '.cue', '.zip', '.7z'],
+    'ps2':        ['.m3u', '.chd', '.iso', '.cso', '.zso', '.gz', '.mdf', '.nrg', '.cue', '.bin', '.elf', '.irx', '.gs', '.acgame', '.zip', '.rar', '.7z'],
     'psp':        ['.iso', '.cso', '.zip'],
     'saturn':     ['.cue', '.bin', '.chd', '.iso', '.zip'],
     'dreamcast':  ['.cdi', '.gdi', '.chd', '.iso', '.zip', '.7z'],
@@ -98,7 +98,7 @@ DISC_SYSTEMS = frozenset((
 # but covers archive-container formats too.  Lower index → higher preference.
 _EXT_RANK = {
     'ps1':       ('.chd', '.pbp', '.zip', '.7z', '.rar', '.iso', '.cue', '.bin', '.img'),
-    'ps2':       ('.chd', '.zip', '.7z', '.iso', '.cue', '.bin'),
+    'ps2':       ('.m3u', '.chd', '.zip', '.7z', '.iso', '.cso', '.zso', '.gz', '.mdf', '.nrg', '.cue', '.bin', '.elf', '.irx', '.gs', '.acgame'),
     'psp':       ('.chd', '.cso', '.zip', '.7z', '.iso', '.pbp'),
     'saturn':    ('.chd', '.zip', '.7z', '.iso', '.cue', '.bin'),
     'segacd':    ('.chd', '.zip', '.7z', '.iso', '.cue', '.bin'),
@@ -801,6 +801,7 @@ def fan_out_search(system_id, title, providers=None, timeout=12):
     """Run search() across registered providers in parallel; merge + rank."""
     targets = providers or list(PROVIDERS.keys())
     out = []
+    ex = ThreadPoolExecutor(max_workers=max(1, len(targets)))
     def _run(name):
         fn = PROVIDERS.get(name, {}).get('search')
         if not fn: return []
@@ -808,7 +809,7 @@ def fan_out_search(system_id, title, providers=None, timeout=12):
         except Exception as e:
             print(f'[rom_providers/{name}] search failed: {e}')
             return []
-    with ThreadPoolExecutor(max_workers=max(1, len(targets))) as ex:
+    try:
         futs = {ex.submit(_run, n): n for n in targets}
         try:
             for f in as_completed(futs, timeout=timeout):
@@ -823,7 +824,15 @@ def fan_out_search(system_id, title, providers=None, timeout=12):
                 else:
                     print(f'[rom_providers/{name}] timed out (>{timeout}s) — partial results returned')
                     f.cancel()
-    out = [c for c in out if title_matches(c.get('filename') or '', title)]
+    finally:
+        # Executor context managers wait for timed-out jobs during __exit__,
+        # defeating the endpoint deadline. Let in-flight HTTP calls unwind in
+        # their own bounded timeouts while this request returns partial data.
+        ex.shutdown(wait=False, cancel_futures=True)
+    # Page-only scrapes cannot be downloaded by /api/rom-proxy. Returning them
+    # made an otherwise useful source list fail on its first attempted item.
+    out = [c for c in out if not (c.get('extras') or {}).get('page_only')
+           and title_matches(c.get('filename') or '', title)]
     for c in out:
         # Stamp the system id so score_candidate() can apply per-system
         # extension-rank and container preferences without each provider

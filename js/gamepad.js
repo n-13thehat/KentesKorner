@@ -116,16 +116,22 @@ function _stopEJSKeyBridge() {
 }
 
 /* ── IN-GAME PAUSE MENU ───────────────────────────────────────── */
-let _igmFocus = 0;  // 0 = RESUME, 1 = CLOSE GAME, 2 = MAIN MENU
+let _igmFocus = 0;  // Index among the currently visible pause-menu actions.
 
 function updateIgmFocus() {
-  document.querySelectorAll('.ingame-btn').forEach((btn, i) => {
+  const buttons = [...document.querySelectorAll('.ingame-btn')].filter(btn => !btn.hidden);
+  if (buttons.length) _igmFocus %= buttons.length;
+  buttons.forEach((btn, i) => {
     btn.classList.toggle('igm-focused', i === _igmFocus);
   });
 }
 
 function showIngameMenu() {
   NativePlayer.menu(true);
+  if (!NativePlayer.active) {
+    try { window.EJS_emulator?.gameManager?.toggleMainLoop?.(false); }
+    catch (e) { console.warn('[EJS] Could not pause game loop:', e); }
+  }
   const badge = document.getElementById('igm-badge');
   if (badge) badge.textContent = NativePlayer.active ? 'GAME MENU' : 'PAUSED';
   const menu = document.getElementById('ingame-menu');
@@ -142,7 +148,15 @@ function showIngameMenu() {
 
 // skipStateReset = true when called from exitEmulator (we'll set state.screen = 'room' there)
 function hideIngameMenu(skipStateReset) {
-  if (!skipStateReset) NativePlayer.menu(false);
+  if (!skipStateReset) {
+    if (NativePlayer.active) {
+      NativePlayer.menu(false);
+    } else {
+      try { window.EJS_emulator?.gameManager?.toggleMainLoop?.(true); }
+      catch (e) { console.warn('[EJS] Could not resume game loop:', e); }
+      _startEJSKeyBridge();
+    }
+  }
   const menu = document.getElementById('ingame-menu');
   if (!menu) return;
   menu.classList.remove('active');
@@ -241,8 +255,9 @@ const DUALSENSE_RE = /dualsense|054c.*0ce6|0ce6.*054c/i;
    Xbox One / Series X|S controllers, and any HID
    gamepad that exposes the W3C "standard" mapping.
 
-   Handles shell navigation only — EmulatorJS
-   manages its own gamepad input while a ROM runs.
+   Handles shell navigation and shared pause-menu routing. EmulatorJS manages
+   browser-ROM input; the Mac NativePlayer separately polls gameplay input
+   into its libretro core while this manager reserves the system Home button.
 ══════════════════════════════════════════ */
 const GamepadManager = (() => {
 
@@ -549,17 +564,17 @@ const GamepadManager = (() => {
     // ── IN-GAME: full input isolation ────────────────────────
     // When a game is running, block every OS action except the
     // PS/Guide/Home button (BTN.HOME), which opens the Kente
-    // shell overlay.  All other buttons — including Start (9) —
-    // are forwarded to the emulator via the EJS keyboard bridge
-    // so games can use their own in-game menus without conflict.
+    // shell overlay. Browser EmulatorJS sessions forward other buttons
+    // through the EJS bridge; Mac NativePlayer polls those buttons directly
+    // into libretro, while Start (9) remains available to the game.
     if (state.screen === 'playing') {
       if (btnIdx === BTN.HOME) showIngameMenu();
-      return; // all other buttons are absorbed by the EJS bridge
+      return; // game input is handled by EJS or the Mac NativePlayer poller
     }
 
     // ── IN-GAME PAUSE MENU navigation ────────────────────────
     if (state.screen === 'paused') {
-      const btns = [...document.querySelectorAll('.ingame-btn')];
+      const btns = [...document.querySelectorAll('.ingame-btn')].filter(btn => !btn.hidden);
       switch (btnIdx) {
         case BTN.DUP:
         case BTN.DLEFT:
