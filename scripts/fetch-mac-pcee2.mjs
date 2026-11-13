@@ -88,7 +88,7 @@ try {
     throw new Error('The source build did not produce pcee2_libretro.dylib.');
   if (!(await stat(moltenVkBinary).catch(() => null))?.isFile())
     throw new Error('The source dependency build did not produce libMoltenVK.dylib.');
-  await run('lipo', ['-verify_arch', arch, core]);
+  await run('lipo', [core, '-verify_arch', arch]);
   const coreSha256 = createHash('sha256').update(await readFile(core)).digest('hex');
   const coreDependencies = await run('otool', ['-L', core]);
 
@@ -100,7 +100,7 @@ try {
   const license = await readFile(path.join(source, 'COPYING.GPLv3'));
   const sourceSha256 = createHash('sha256').update(await readFile(sourceArchive)).digest('hex');
   const moltenVkUrl = `https://github.com/KhronosGroup/MoltenVK/releases/download/${moltenVkVersion}/MoltenVK-macos.tar`;
-  await run('lipo', ['-verify_arch', arch, moltenVkBinary]);
+  await run('lipo', [moltenVkBinary, '-verify_arch', arch]);
   const moltenVkSha256 = createHash('sha256').update(await readFile(moltenVkBinary)).digest('hex');
   const moltenVkDependencies = await run('otool', ['-L', moltenVkBinary]);
 
