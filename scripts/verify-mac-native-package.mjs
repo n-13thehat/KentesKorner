@@ -90,7 +90,7 @@ for (const file of files) {
   if (!info?.isFile() || info.size < 100) throw new Error(`Mac native package component missing: ${file}`);
 }
 for (const file of [files[0], files[1], files[2], files[8], appRuntimeFiles[0]])
-  execFileSync('lipo', ['-verify_arch', arch, file]);
+  execFileSync('lipo', [file, '-verify_arch', arch]);
 const license = await readFile(files[3], 'utf8');
 if (!license.includes('GNU GENERAL PUBLIC LICENSE') || !license.includes('Version 3'))
   throw new Error('The bundled PCEE2 GPLv3 license is invalid.');
@@ -133,7 +133,7 @@ const executable = (await readdir(executableDir, { withFileTypes: true }))
   .find(entry => entry.isFile());
 if (!executable) throw new Error('The packaged Mac app executable is missing.');
 const appExecutable = path.join(executableDir, executable.name);
-execFileSync('lipo', ['-verify_arch', arch, appExecutable]);
+execFileSync('lipo', [appExecutable, '-verify_arch', arch]);
 function rpaths(binary) {
   const loadCommands = execFileSync('otool', ['-l', binary], { encoding: 'utf8' });
   return loadCommands.split(/Load command \d+\n/)
@@ -173,7 +173,7 @@ for (const binary of [files[0], files[1], core, moltenVk]) {
     const insideBundle = path.relative(path.join(app, 'Contents'), resolved);
     if (insideBundle.startsWith(`..${path.sep}`) || path.isAbsolute(insideBundle))
       throw new Error(`A packaged native player binary depends on a library outside the app bundle: ${name}`);
-    execFileSync('lipo', ['-verify_arch', arch, resolved]);
+    execFileSync('lipo', [resolved, '-verify_arch', arch]);
   }
 }
 console.log(`Verified packaged Mac native components for ${arch}: ${path.basename(app)}`);
