@@ -148,6 +148,9 @@ for (const binary of [files[0], files[1], core, moltenVk]) {
     const dependency = line.trim().match(/^(.+?)\s+\(compatibility version/);
     if (!dependency) continue;
     const name = dependency[1];
+    // `otool -L` lists a dylib's LC_ID_DYLIB as its first entry. That is the
+    // binary's install name, not a dependency that the loader must resolve.
+    if (name === `@rpath/${path.basename(binary)}`) continue;
     if (name.startsWith('/System/Library/') || name.startsWith('/usr/lib/')) continue;
     let resolved = null;
     if (name.startsWith('@loader_path/'))
